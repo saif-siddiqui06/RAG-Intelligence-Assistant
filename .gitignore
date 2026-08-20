@@ -1,0 +1,46 @@
+# Byte-compiled / cache
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Environment variables
+.env
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+
+# Testing / coverage
+.coverage
+htmlcov/
+
+# Logs
+logs/*.log
+
+# Data (keep folder structure, ignore contents)
+data/uploads/*
+data/processed/*
+data/vectorstore/*
+!data/uploads/.gitkeep
+!data/processed/.gitkeep
+!data/vectorstore/.gitkeep
+
+# IDE
+.vscode/
+.idea/
+
+# Claude Code harness state
+.claude/
+
+# OS
+.DS_Store
+Thumbs.db
