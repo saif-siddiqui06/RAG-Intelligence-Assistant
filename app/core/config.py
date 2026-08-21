@@ -70,6 +70,12 @@ class Settings(BaseSettings):
     reranker_backend: str = "cross_encoder"  # "cross_encoder" | "none"
     reranker_model: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"
 
+    # --- Agent (Milestone 4) ---
+    agent_max_iterations: int = 5  # max tool calls before the fallback response kicks in
+    agent_tool_timeout_seconds: float = 20.0  # per-tool-call wall-clock limit
+    web_search_max_results: int = 5
+    summary_max_chars: int = 12000  # chunk content budget fed to the summarizer per document
+
     # --- Storage paths ---
     upload_dir: Path = BASE_DIR / "data" / "uploads"
     processed_dir: Path = BASE_DIR / "data" / "processed"

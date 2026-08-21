@@ -9,13 +9,12 @@ This repository is built **incrementally, milestone by milestone**. This
 README reflects the current milestone and will be updated as each new one
 lands.
 
-> **Current milestone: 3 — Hybrid Retrieval + Reranking.**
-> Vector search + BM25 keyword search, fused with Reciprocal Rank Fusion,
-> reranked with a local cross-encoder — all behind a `RETRIEVAL_MODE`
-> config switch that leaves the Milestone 2 vector-only path completely
-> unchanged. Full per-stage diagnostics, a 22-question retrieval benchmark,
-> and a from-scratch measured comparison of all four strategies. No agents
-> yet — that's by design. See [Roadmap](#4-roadmap).
+> **Current milestone: 4 — Agent Layer.**
+> A tool-using agent sits in front of the RAG pipeline: it decides — per
+> query — whether to search the uploaded documents, search the web,
+> run a calculation, summarize a document, some combination, or answer
+> directly. Structured tool inputs, per-tool timeouts, a max-iteration
+> cap, and a safe, chain-of-thought-free response. See [§11](#11-agent-explained--10-example-queries).
 
 ---
 
@@ -37,14 +36,13 @@ lands.
                                   │
                                   ▼
                        ┌─────────────────────┐
-                       │   Agent / Router    │   ← not built yet (Milestone 4)
+                       │   Agent / Router    │   ← implemented (app/agents, JSON-action loop)
                        │      (Gemini)       │
                        └──────────┬──────────┘
                                   │
-             ┌────────────────────┼────────────────────┐
-             │                    │                    │
-             ▼                    ▼                    ▼
-       Document RAG          Web Search           Calculator      ← tools not built yet
+        ┌────────────┬────────────┼────────────┬────────────┐
+        ▼            ▼            ▼            ▼            │
+  Document RAG   Web Search   Calculator  Doc Summary   (all 4 tools implemented)
              │
              ▼
       Query Rewriting                                              ← implemented
@@ -135,13 +133,46 @@ exactly which module does what.
 unchanged Milestone 2 `RetrievalService` — see [§10](#10-hybrid-retrieval-explained)
 for why each stage exists and when it actually helps.
 
-### What exists today (Milestone 0 + 1 + 2 + 3)
+### This milestone's addition: the agent loop (`POST /api/v1/agent`)
+
+```
+User
+ │
+ ▼
+Agent ─────────────► LLM decides ONE action per turn: call a tool, or
+ │                    give a final_answer — never both, never blindly
+ ▼
+Tool Selection ────► parsed from the model's JSON response
+ │                    (app.agents.parsing.parse_agent_action)
+ ▼
+Tools ─────────────► document_search_tool | web_search_tool |
+ │                    calculator_tool | document_summary_tool
+ ▼
+Observation ───────► the tool's output (or a caught error/timeout) is
+ │                    appended to the conversation and fed back in
+ ▼
+ ... repeats (max agent_max_iterations turns) ...
+ │
+ ▼
+Final Answer ──────► {answer, tools_used, sources, reasoning_summary,
+                       execution_time} — see §11 for the full explanation
+                       and 10 worked example queries.
+```
+
+This is a separate service from the plain chat pipeline
+(`app.services.agent_service`, not `chat_service`) — `document_search_tool`
+*calls* `ChatService` for its RAG work rather than reimplementing it, so the
+agent always benefits from whatever retrieval mode/settings are configured.
+
+### What exists today (Milestone 0 + 1 + 2 + 3 + 4)
 
 ```
 Streamlit  →  FastAPI  →  /api/v1/health
                        →  /api/v1/documents/{upload,list,get,delete,reindex,chunks,stats}
                        →  /api/v1/chat, /api/v1/chat/stream
-                              │
+                       →  /api/v1/agent  ──►  AgentService → AgentOrchestrator → 4 tools
+                              │              (app/agents, app/services/agent_service.py —
+                              │               document_search_tool calls ChatService below)
                  ┌────────────┴─────────────┐
                  ▼                          ▼
          DocumentService              ChatService ──── picks retrieval_mode:
@@ -171,11 +202,10 @@ Streamlit  →  FastAPI  →  /api/v1/health
                       (app/database — SQLite by default)
 ```
 
-The agent router, web search/calculator tools, and the rest of the
-evaluation harness (answer correctness/faithfulness, beyond the
-retrieval benchmark this milestone added) are still empty placeholder
-packages with docstrings — no logic yet. This keeps the codebase honest:
-imports don't lie about what's implemented.
+Only the rest of the evaluation harness (answer correctness/faithfulness,
+beyond the retrieval benchmark Milestone 3 added) is still an empty
+placeholder package. This keeps the codebase honest: imports don't lie
+about what's implemented.
 
 ---
 
@@ -192,7 +222,8 @@ RAG/
 │   │       └── endpoints/
 │   │           ├── health.py    #   GET /health
 │   │           ├── documents.py #   document upload/list/get/delete/reindex/chunks/stats
-│   │           └── chat.py      #   POST /chat, POST /chat/stream
+│   │           ├── chat.py      #   POST /chat, POST /chat/stream
+│   │           └── agent.py     #   POST /agent
 │   ├── core/
 │   │   ├── config.py            #   Settings: app, DB, chunking, retrieval, confidence thresholds
 │   │   ├── logging.py           #   logging.dictConfig setup (console + rotating file)
@@ -200,13 +231,15 @@ RAG/
 │   ├── models/                  # Pydantic schemas (API contracts), not ORM models
 │   │   ├── schemas.py           #   HealthResponse
 │   │   ├── document.py          #   Document/Chunk/Stats request-response schemas
-│   │   └── chat.py              #   ChatRequest/ChatResponse/SourceCitation/ChatStreamMeta
+│   │   ├── chat.py              #   ChatRequest/ChatResponse/SourceCitation/ChatStreamMeta
+│   │   └── agent.py             #   AgentRequest/AgentResponse/ToolSourceOut
 │   ├── services/
 │   │   ├── document_service.py  #   Orchestrates rag/ingestion + database for documents
 │   │   ├── chunk_lookup.py      #   Shared SQL helpers (RetrievedChunk, filters) — both retrieval services use this
 │   │   ├── retrieval_service.py #   Vector-only retrieval (Milestone 2, unchanged)
 │   │   ├── hybrid_retrieval_service.py  # Vector + BM25 + RRF fusion + rerank (Milestone 3)
-│   │   └── chat_service.py      #   The conversational RAG orchestrator (memory→...→response)
+│   │   ├── chat_service.py      #   The conversational RAG orchestrator (memory→...→response)
+│   │   └── agent_service.py     #   Builds the 4 tools per-request, runs AgentOrchestrator (Milestone 4)
 │   ├── rag/                     # RAG pipeline — pure logic, no DB/HTTP
 │   │   ├── ingestion/           #   extraction, cleaning, chunking, hashing (Milestone 1)
 │   │   ├── embeddings/          #   BaseEmbedder interface + Gemini implementation
@@ -226,7 +259,12 @@ RAG/
 │   │   │   ├── query_rewriter.py    # LLM call #1: conversation -> standalone query
 │   │   │   └── answer_generator.py  # LLM call #2: query+chunks -> cited answer (streamable)
 │   │   └── dependencies.py      #   cached singletons (embedder, vector store, reranker, rewriter, generator)
-│   ├── agents/                  # [empty] LLM agent/router + tools (doc search, web search, calculator)
+│   ├── agents/                  # Milestone 4: the agent loop
+│   │   ├── tools/                #  document_search (calls ChatService), web_search (ddgs, free),
+│   │   │                         #  calculator (safe AST eval, no eval()), document_summary
+│   │   ├── prompts.py            #  agent system prompt (JSON-action protocol)
+│   │   ├── parsing.py            #  parses the action JSON; builds the safe reasoning_summary
+│   │   └── orchestrator.py       #  the loop: max iterations, per-tool timeout, fallback
 │   ├── evaluation/
 │   │   ├── dataset.py           #   14-passage corpus + 22 question/relevant-id pairs
 │   │   ├── metrics.py           #   Recall@k, MRR (pure functions)
@@ -410,8 +448,8 @@ User Query → Memory → Query Rewrite → Retrieval → Context Selection → 
 2. ~~**Core retrieval + generation**~~ — done (Milestone 2).
 3. ~~**Advanced retrieval**~~ — hybrid (vector + BM25) search + reranking —
    done this milestone.
-4. **Agent layer** — LLM-based router/tools: document search, web search,
-   calculator.
+4. ~~**Agent layer**~~ — LLM-based tool-selecting agent (document search,
+   web search, calculator, document summary) — done this milestone.
 5. **Memory** — full session management (titles, ownership, expiry) on top
    of the `ConversationRecord`/`MessageRecord` tables already in place.
 6. **Evaluation** — context relevance, answer correctness,
@@ -481,6 +519,23 @@ RERANKER_BACKEND=cross_encoder   # or "none" to disable reranking
 RERANKER_MODEL=cross-encoder/ms-marco-MiniLM-L-6-v2
 ```
 
+Agent settings (all optional, sensible defaults):
+
+```
+AGENT_MAX_ITERATIONS=5           # max tool calls before the fallback response
+AGENT_TOOL_TIMEOUT_SECONDS=20.0  # per-tool-call wall-clock limit
+WEB_SEARCH_MAX_RESULTS=5
+SUMMARY_MAX_CHARS=12000          # chunk-content budget per document_summary_tool call
+```
+
+**Gemini's free tier is request-limited per day, not just per minute**
+(e.g. 20 requests/day for some models at the time of writing) — the agent
+makes 2+ LLM calls per query (one per reasoning step, plus whatever
+`document_search_tool` uses internally), so it can exhaust a free-tier
+daily quota faster than the plain chat endpoint. A `429 RESOURCE_EXHAUSTED`
+surfaces as a clean `502` from the API, not a crash — check
+https://ai.google.dev/gemini-api/docs/rate-limits for current limits.
+
 ## 6. Running
 
 ### Backend (FastAPI)
@@ -524,6 +579,10 @@ pytest -v
 | `tests/test_reranker.py` | **Reranking**: `NoOpReranker` preserves order, the *real* cross-encoder (cached locally, no network) scores a relevant document higher than an irrelevant one and returns sigmoid-normalized [0,1] scores |
 | `tests/test_hybrid_retrieval_service.py` | **Hybrid pipeline integration**: BM25 surfaces an exact term vector search's fixed vocabulary can't represent, fusion favors items both engines found, reranking produces a valid sorted order over real content, `final_context_k` is respected, near-duplicate dedup, metadata-filter/empty-corpus edge cases |
 | `tests/test_evaluation_metrics.py` | Recall@k and MRR (pure functions) |
+| `tests/test_calculator_tool.py` | **Calculator tool**: arithmetic correctness, percentage/percentage-improvement expressions, rejects function calls/names/invalid syntax (never uses `eval()`), division-by-zero and missing-input error handling |
+| `tests/test_agent_parsing.py` | **Action parsing**: plain JSON, markdown-fenced JSON, JSON embedded in surrounding text, missing-action/garbage → `None`, `reasoning_summary` matches the exact example format and never leaks tool input text |
+| `tests/test_agent_orchestrator.py` | **Tool selection + execution**: the model's named tool is called with its exact input, multi-tool (compound) queries call tools in order, sources aggregate across tools, unknown-tool/tool-exception/tool-timeout are all caught and fed back as observations without crashing, max-iterations triggers the fallback instead of hanging, unparseable model output is treated as the final answer, reasoning_summary never contains raw model text |
+| `tests/test_document_tools.py` | **document_search_tool / document_summary_tool** integration: grounded answer + sources via the real `ChatService` (fakes for the LLM/embedder), summarize-by-filename, not-found handling |
 
 None of the tests above call the real Gemini API: `tests/fakes.py` provides a
 `KeywordFakeEmbedder` (deterministic, keyword-overlap-based similarity — good
@@ -615,9 +674,82 @@ document's topic otherwise).
       milestone (it's the same code path, untouched).
 - [ ] `python -m app.evaluation.retrieval_benchmark` runs and prints a
       4-strategy comparison table (§10 below has a real run's output).
+- [ ] `pytest -v` passes (114+ tests, including the new agent suite).
+- [ ] `POST /api/v1/agent` with `{"query": "What is 17.5% of 850?"}` returns
+      `tools_used: ["calculator_tool"]` and the correct number.
+- [ ] The same endpoint with a question about an uploaded document returns
+      `tools_used: ["document_search_tool"]` and real citations in `sources`.
+- [ ] The compound example query (§11) calls both
+      `document_search_tool` and `calculator_tool`.
+- [ ] `reasoning_summary` is always a short phrase like "Used document
+      search and calculator." — never raw model text or JSON.
 
-Once all of the above are true, hybrid retrieval + reranking is confirmed
-working end-to-end and we can start Milestone 4 (the agent layer).
+Once all of the above are true, the agent layer is confirmed working
+end-to-end and we can start Milestone 5 (full session/memory management).
+
+---
+
+## 11. Agent, explained + 10 example queries
+
+### Why a separate agent service
+
+`app.services.agent_service` is intentionally not part of
+`chat_service.py`: the plain chat endpoint always runs the RAG pipeline;
+the agent *decides* whether to run it at all, decides how many times,
+and can combine it with tools that have nothing to do with retrieval. Reusing
+`ChatService` from inside `document_search_tool` — rather than duplicating
+retrieval/generation logic in the agent — is what keeps them separate
+without duplicating the RAG pipeline itself.
+
+### The loop, and its guardrails
+
+Each turn, the model returns exactly one JSON action — never silent,
+unstructured tool use. The orchestrator enforces:
+
+- **Structured inputs** — every tool declares its parameters (name +
+  description) in the system prompt; `parse_agent_action` only accepts a
+  well-formed `{"action": ..., "action_input": {...}}` object.
+- **Error handling** — an unknown tool name, a tool that raises, or a
+  tool that times out all become an *observation* fed back to the model
+  (`"Error: ..."`), never an unhandled exception. The model gets a chance
+  to adapt (try something else, or explain the limitation) instead of the
+  whole request failing.
+- **Maximum iterations** (`AGENT_MAX_ITERATIONS`, default 5) — if the
+  model never produces a `final_answer`, the loop stops and returns a
+  clearly-labeled fallback answer built from the last real observation,
+  rather than looping forever or timing out the HTTP request.
+- **Per-tool timeout** (`AGENT_TOOL_TIMEOUT_SECONDS`, default 20s) — run
+  via a `ThreadPoolExecutor` that is *not* waited on after a timeout (a
+  `with`-block executor would block `shutdown()` on a genuinely hung
+  thread, defeating the timeout entirely).
+- **No hidden chain-of-thought** — `reasoning_summary` is built purely
+  from the list of tool *names* actually called
+  (`app.agents.parsing.build_reasoning_summary`), never from the model's
+  own JSON or reasoning text. "Used document search and calculator." is
+  the literal, deterministic output shape — not something the LLM writes.
+
+### 10 example queries and the tool(s) each should select
+
+| # | Query | Expected tool(s) | Why |
+|---|---|---|---|
+| 1 | "What does my uploaded research paper say about SMOTE?" | `document_search_tool` | Explicit reference to an uploaded document. |
+| 2 | "What happened in AI research this week?" | `web_search_tool` | Current events — not in any uploaded document. |
+| 3 | "What is 17.5% of 850?" | `calculator_tool` | Pure arithmetic, no external knowledge needed. |
+| 4 | "Summarize research_paper.pdf" | `document_summary_tool` | Explicit "summarize" + a filename, not a narrow factual question. |
+| 5 | "According to my paper, what is SMOTE, and calculate the percentage improvement from 72% to 84%?" | `document_search_tool` **+** `calculator_tool` | A compound query — the model must call both tools in sequence and combine the results. |
+| 6 | "What's 2 + 2?" | *none* — direct answer | Trivial enough that calling a tool would be "blind tool use"; the system prompt explicitly discourages this. |
+| 7 | "What's the latest version of Python?" | `web_search_tool` | General/current knowledge, unrelated to uploaded documents. |
+| 8 | "Does my document mention Random Forest, and if so, how does its accuracy compare to a 15% baseline improvement?" | `document_search_tool` **+** `calculator_tool` | Needs a document fact *and* a computed comparison. |
+| 9 | "Give me an overview of the SMOTE paper I uploaded." | `document_summary_tool` | "Overview" of a specific uploaded document — summarization, not a narrow question. |
+| 10 | "What is the square root of 2 multiplied by the number of pages in my document?" | `document_search_tool` **+** `calculator_tool` | The page count must come from the document first; the arithmetic depends on that result — a genuine multi-step case. |
+
+Queries 1–4 were live-tested against the real Gemini API during
+development (including the exact compound example, #5) and selected the
+tools shown above every time. Queries 6–10 follow directly from the same
+prompt rules and tool descriptions — they weren't separately live-tested
+due to the free tier's daily request quota, but are exercised in
+`tests/test_agent_orchestrator.py` with scripted model responses that
+mirror this exact decision pattern.
 
 ---
 
