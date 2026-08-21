@@ -11,3 +11,8 @@ requests>=2.32,<3.0
 google-genai>=1.0,<2.0
 faiss-cpu>=1.9,<2.0
 pypdf>=5.0,<6.0
+rank_bm25>=0.2.2,<0.3
+# sentence-transformers pulls in torch. Install the small CPU-only torch
+# wheel FIRST to avoid a multi-GB default download:
+#   pip install torch --index-url https://download.pytorch.org/whl/cpu
+sentence-transformers>=3.0,<4.0

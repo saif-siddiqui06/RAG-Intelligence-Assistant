@@ -51,7 +51,7 @@ class Settings(BaseSettings):
     chunk_overlap: int = 150
     chunk_separators: list[str] = ["\n\n", "\n", ". ", " ", ""]
 
-    # --- RAG / retrieval & chat ---
+    # --- RAG / retrieval & chat (vector-only mode — unchanged since Milestone 2) ---
     retrieval_top_k: int = 5
     retrieval_overfetch_multiplier: int = 4  # candidates fetched = top_k * this, before dedup/threshold
     min_relevance_score: float = 0.15  # cosine similarity floor; below this, a chunk is treated as noise
@@ -59,6 +59,16 @@ class Settings(BaseSettings):
     conversation_history_window: int = 6  # messages (not turns) kept for query rewriting
     confidence_high_threshold: float = 0.5  # avg cited-chunk similarity above this -> "high"
     confidence_medium_threshold: float = 0.3  # above this (but below high) -> "medium", else "low"
+
+    # --- RAG / hybrid retrieval (Milestone 3) ---
+    retrieval_mode: str = "vector"  # "vector" (unchanged Milestone 2 path) | "hybrid"
+    vector_top_k: int = 20  # candidates fetched from FAISS before fusion
+    bm25_top_k: int = 20  # candidates fetched from BM25 before fusion
+    rerank_top_k: int = 10  # top fused candidates actually sent to the reranker
+    final_context_k: int = 5  # chunks that survive rerank + dedup and reach the LLM
+    rrf_k: int = 60  # Reciprocal Rank Fusion constant (Cormack et al. 2009's standard default)
+    reranker_backend: str = "cross_encoder"  # "cross_encoder" | "none"
+    reranker_model: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"
 
     # --- Storage paths ---
     upload_dir: Path = BASE_DIR / "data" / "uploads"

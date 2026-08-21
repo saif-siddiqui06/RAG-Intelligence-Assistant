@@ -62,11 +62,28 @@ def _render_meta(meta: dict) -> None:
 
     with st.expander("Retrieval details"):
         st.caption(f"Rewritten query: `{meta.get('rewritten_query', '')}`")
-        for chunk in meta.get("retrieved_chunks", []):
-            st.text(
-                f"score={chunk['score']:.3f}  ·  {chunk['filename']}  ·  page {chunk['page_number']}"
-            )
-            st.caption(chunk["content"][:300])
+
+        diagnostics = meta.get("retrieval_diagnostics")
+        if diagnostics:
+            st.caption("**Hybrid retrieval pipeline** — vector + BM25 → fusion → rerank:")
+            stage_tabs = st.tabs(["Vector", "Keyword (BM25)", "Fused", "Reranked (final)"])
+            stage_keys = ["vector_results", "keyword_results", "fused_results", "reranked_results"]
+            for tab, key in zip(stage_tabs, stage_keys):
+                with tab:
+                    stage_chunks = diagnostics.get(key, [])
+                    if not stage_chunks:
+                        st.caption("(no candidates at this stage)")
+                    for chunk in stage_chunks:
+                        st.text(
+                            f"score={chunk['score']:.3f}  ·  {chunk['filename']}  ·  page {chunk['page_number']}"
+                        )
+                        st.caption(chunk["content"][:300])
+        else:
+            for chunk in meta.get("retrieved_chunks", []):
+                st.text(
+                    f"score={chunk['score']:.3f}  ·  {chunk['filename']}  ·  page {chunk['page_number']}"
+                )
+                st.caption(chunk["content"][:300])
 
 
 with chat_tab:

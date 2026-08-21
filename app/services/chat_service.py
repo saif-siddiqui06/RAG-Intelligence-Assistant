@@ -7,8 +7,15 @@ Request lifecycle (see README for the full diagram):
 
 This module is the only thing that sequences those steps; each step
 itself lives in its own module (app.rag.generation for rewriting/
-generation, app.services.retrieval_service for retrieval) so any one of
-them can be swapped or tested without touching the others.
+generation, app.services.retrieval_service / hybrid_retrieval_service
+for retrieval) so any one of them can be swapped or tested without
+touching the others.
+
+Retrieval itself branches on `Settings.retrieval_mode`:
+- "vector" (default) — the unchanged Milestone 2 path, RetrievalService.
+- "hybrid" — vector + BM25, fused (RRF) and reranked (cross-encoder),
+  via HybridRetrievalService. Only this branch populates
+  `retrieval_diagnostics` on the response.
 
 `prepare()` is deliberately a plain method, not a generator — it does
 query rewriting and retrieval (which embeds the query, a real failure
@@ -29,13 +36,21 @@ from app.models.chat import (
     ChatRequest,
     ChatResponse,
     ChatStreamMeta,
+    RetrievalDiagnostics,
     RetrievedChunkOut,
     SourceCitation,
 )
-from app.rag.dependencies import get_answer_generator, get_query_rewriter, get_vector_retriever
+from app.rag.dependencies import (
+    get_answer_generator,
+    get_query_rewriter,
+    get_reranker,
+    get_vector_retriever,
+)
 from app.rag.generation.answer_generator import extract_cited_indices, is_no_context_answer
 from app.rag.generation.prompts import NO_CONTEXT_SENTINEL
-from app.services.retrieval_service import RetrievalService, RetrievedChunk
+from app.services.chunk_lookup import RetrievedChunk
+from app.services.hybrid_retrieval_service import HybridRetrievalResult, HybridRetrievalService
+from app.services.retrieval_service import RetrievalService
 
 STREAM_META_DELIMITER = "\n<<<META>>>\n"
 
@@ -47,6 +62,7 @@ class PreparedChat:
     rewritten_query: str
     retrieved: list[RetrievedChunk]
     relevant: list[RetrievedChunk]
+    diagnostics: HybridRetrievalResult | None = None
 
 
 class ChatService:
@@ -66,17 +82,32 @@ class ChatService:
         rewritten_query = self.query_rewriter.rewrite(history, request.question)
 
         document_type = request.document_type.value if request.document_type else None
-        retrieved = self.retrieval_service.retrieve(
-            rewritten_query,
-            top_k=request.top_k,
-            document_id=request.document_id,
-            document_type=document_type,
-        )
+        diagnostics: HybridRetrievalResult | None = None
+
+        if self.settings.retrieval_mode == "hybrid":
+            hybrid_service = HybridRetrievalService(
+                self.db, get_vector_retriever(), get_reranker(), self.settings
+            )
+            diagnostics = hybrid_service.retrieve(
+                rewritten_query, document_id=request.document_id, document_type=document_type
+            )
+            retrieved = diagnostics.final_chunks
+        else:
+            retrieved = self.retrieval_service.retrieve(
+                rewritten_query,
+                top_k=request.top_k,
+                document_id=request.document_id,
+                document_type=document_type,
+            )
+
         relevant = [c for c in retrieved if c.score >= self.settings.min_relevance_score]
-        return PreparedChat(conversation, request.question, rewritten_query, retrieved, relevant)
+        return PreparedChat(
+            conversation, request.question, rewritten_query, retrieved, relevant, diagnostics
+        )
 
     def ask(self, request: ChatRequest) -> ChatResponse:
         prepared = self.prepare(request)
+        diagnostics_out = _to_diagnostics_out(prepared.diagnostics)
 
         if not prepared.relevant:
             self._persist_turn(prepared.conversation, prepared.original_question, NO_CONTEXT_SENTINEL)
@@ -87,6 +118,7 @@ class ChatService:
                 confidence="low",
                 rewritten_query=prepared.rewritten_query,
                 session_id=prepared.conversation.id,
+                retrieval_diagnostics=diagnostics_out,
             )
 
         answer_text = self.answer_generator.generate(prepared.rewritten_query, prepared.relevant)
@@ -100,6 +132,7 @@ class ChatService:
             confidence=confidence,
             rewritten_query=prepared.rewritten_query,
             session_id=prepared.conversation.id,
+            retrieval_diagnostics=diagnostics_out,
         )
 
     def stream_answer(self, prepared: PreparedChat) -> Iterator[str]:
@@ -130,6 +163,7 @@ class ChatService:
             confidence=confidence,
             rewritten_query=prepared.rewritten_query,
             session_id=prepared.conversation.id,
+            retrieval_diagnostics=_to_diagnostics_out(prepared.diagnostics),
         )
         yield STREAM_META_DELIMITER + meta.model_dump_json()
 
@@ -215,4 +249,15 @@ def _to_chunk_out(chunk: RetrievedChunk) -> RetrievedChunkOut:
         chunk_index=chunk.chunk_index,
         content=chunk.content,
         score=chunk.score,
+    )
+
+
+def _to_diagnostics_out(diagnostics: HybridRetrievalResult | None) -> RetrievalDiagnostics | None:
+    if diagnostics is None:
+        return None
+    return RetrievalDiagnostics(
+        vector_results=[_to_chunk_out(c) for c in diagnostics.vector_results],
+        keyword_results=[_to_chunk_out(c) for c in diagnostics.keyword_results],
+        fused_results=[_to_chunk_out(c) for c in diagnostics.fused_results],
+        reranked_results=[_to_chunk_out(c) for c in diagnostics.reranked_results],
     )

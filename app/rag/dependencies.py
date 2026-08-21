@@ -15,6 +15,9 @@ from app.rag.generation.query_rewriter import QueryRewriter
 from app.rag.ingestion.chunker import ChunkingConfig, RecursiveCharacterChunker
 from app.rag.ingestion.extractor import PDFExtractor
 from app.rag.ingestion.pipeline import IngestionPipeline
+from app.rag.reranking.base import BaseReranker
+from app.rag.reranking.cross_encoder_reranker import CrossEncoderReranker
+from app.rag.reranking.noop_reranker import NoOpReranker
 from app.rag.retrieval.vector_retriever import VectorRetriever
 from app.rag.vectorstore.base import VectorStore
 from app.rag.vectorstore.factory import get_vector_store
@@ -49,6 +52,17 @@ def get_query_rewriter() -> QueryRewriter:
 @lru_cache
 def get_answer_generator() -> AnswerGenerator:
     return AnswerGenerator(get_chat_model())
+
+
+@lru_cache
+def get_reranker() -> BaseReranker:
+    settings = get_settings()
+    backend = settings.reranker_backend.lower()
+    if backend == "none":
+        return NoOpReranker()
+    if backend == "cross_encoder":
+        return CrossEncoderReranker(settings.reranker_model)
+    raise ValueError(f"Unsupported reranker backend: {backend!r}")
 
 
 def build_ingestion_pipeline(

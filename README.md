@@ -9,11 +9,13 @@ This repository is built **incrementally, milestone by milestone**. This
 README reflects the current milestone and will be updated as each new one
 lands.
 
-> **Current milestone: 2 — Core Advanced RAG (retrieval + generation).**
-> Semantic retrieval, metadata filtering, LLM query rewriting, bounded
-> conversational memory, context selection/dedup, grounded + cited answer
-> generation, hallucination prevention, and streaming. No hybrid search,
-> reranking or agents yet — that's by design. See [Roadmap](#4-roadmap).
+> **Current milestone: 3 — Hybrid Retrieval + Reranking.**
+> Vector search + BM25 keyword search, fused with Reciprocal Rank Fusion,
+> reranked with a local cross-encoder — all behind a `RETRIEVAL_MODE`
+> config switch that leaves the Milestone 2 vector-only path completely
+> unchanged. Full per-stage diagnostics, a 22-question retrieval benchmark,
+> and a from-scratch measured comparison of all four strategies. No agents
+> yet — that's by design. See [Roadmap](#4-roadmap).
 
 ---
 
@@ -48,14 +50,14 @@ lands.
       Query Rewriting                                              ← implemented
              │
              ▼
-       Hybrid Retrieval                                             ← vector-only so far;
-       ┌──────────────┐                                               BM25 + reranker not yet
+       Hybrid Retrieval                                             ← implemented (RETRIEVAL_MODE=hybrid;
+       ┌──────────────┐                                               RETRIEVAL_MODE=vector keeps M2's path)
        │ Vector Search│  ← implemented
-       │ BM25 Search  │  ← not built yet
+       │ BM25 Search  │  ← implemented (rank_bm25, fused via RRF)
        └──────┬───────┘
               ▼
-          Reranker                                                  ← not built yet
-              │
+          Reranker                                                  ← implemented (local cross-encoder,
+              │                                                        RERANKER_BACKEND=cross_encoder|none)
               ▼
        Relevant Chunks                                               ← implemented (dedup)
               │
@@ -99,7 +101,41 @@ Response ────────────► {answer, sources, retrieved_chu
 See [§3](#3-request-lifecycle-explained) for a step-by-step walkthrough of
 exactly which module does what.
 
-### What exists today (Milestone 0 + 1 + 2)
+### This milestone's addition: hybrid retrieval (`RETRIEVAL_MODE=hybrid`)
+
+```
+                    User Query (rewritten)
+                          │
+             ┌────────────┴────────────┐
+             ▼                         ▼
+       Vector Search              Keyword Search
+      (VectorRetriever,            (BM25Retriever,
+       FAISS, top vector_top_k)     rank_bm25, top bm25_top_k)
+             │                         │
+             └────────────┬────────────┘
+                          ▼
+                  Result Fusion (RRF)
+              Reciprocal Rank Fusion — combines
+              rank position, not raw scores (vector
+              cosine and BM25 scores aren't comparable)
+                          │
+                          ▼  top rerank_top_k
+                      Reranker
+              cross-encoder scores (query, chunk) jointly
+              (CrossEncoderReranker | NoOpReranker)
+                          │
+                          ▼
+              Dedup + top final_context_k
+                          │
+                          ▼
+                         LLM
+```
+
+`RETRIEVAL_MODE=vector` (the default) skips all of this and uses the
+unchanged Milestone 2 `RetrievalService` — see [§10](#10-hybrid-retrieval-explained)
+for why each stage exists and when it actually helps.
+
+### What exists today (Milestone 0 + 1 + 2 + 3)
 
 ```
 Streamlit  →  FastAPI  →  /api/v1/health
@@ -108,17 +144,22 @@ Streamlit  →  FastAPI  →  /api/v1/health
                               │
                  ┌────────────┴─────────────┐
                  ▼                          ▼
-         DocumentService              ChatService
-      (ingestion orchestration)   (conversational RAG orchestration)
-                 │                          │
-                 ▼                    ┌─────┴──────┐
-        IngestionPipeline             ▼            ▼
-       (app/rag/ingestion)   RetrievalService   QueryRewriter / AnswerGenerator
-                 │           (app/services)     (app/rag/generation)
-                 │                  │                    │
-                 └──────────┬───────┘                    │
-                            ▼                             │
-              Gemini embeddings ◄──────── shared ─────────┘
+         DocumentService              ChatService ──── picks retrieval_mode:
+      (ingestion orchestration)   (conversational RAG orchestration)  │
+                 │                          │                         │
+                 ▼                    ┌─────┴──────┐          ┌──────┴───────┐
+        IngestionPipeline             ▼            ▼          ▼              ▼
+       (app/rag/ingestion)   QueryRewriter / AnswerGenerator  RetrievalService  HybridRetrievalService
+                 │           (app/rag/generation)             (vector-only,     (vector+BM25+RRF+
+                 │                  │                          app/services)     rerank, app/services)
+                 │                  │                          │                 │
+                 │                  │                          └────────┬────────┘
+                 │                  │                                   ▼
+                 │                  │                       BM25Retriever + fusion.py + BaseReranker
+                 │                  │                       (app/rag/retrieval, app/rag/reranking)
+                 └──────────┬───────┘                                   │
+                            ▼                                           │
+              Gemini embeddings ◄──────── shared ────────────────────────
               (app/rag/embeddings)              Gemini chat completions
                             │
                             ▼
@@ -130,8 +171,9 @@ Streamlit  →  FastAPI  →  /api/v1/health
                       (app/database — SQLite by default)
 ```
 
-The agent router, web search/calculator tools, hybrid (BM25) retrieval,
-reranking, and the evaluation harness are all still empty placeholder
+The agent router, web search/calculator tools, and the rest of the
+evaluation harness (answer correctness/faithfulness, beyond the
+retrieval benchmark this milestone added) are still empty placeholder
 packages with docstrings — no logic yet. This keeps the codebase honest:
 imports don't lie about what's implemented.
 
@@ -161,28 +203,40 @@ RAG/
 │   │   └── chat.py              #   ChatRequest/ChatResponse/SourceCitation/ChatStreamMeta
 │   ├── services/
 │   │   ├── document_service.py  #   Orchestrates rag/ingestion + database for documents
-│   │   ├── retrieval_service.py #   DB-aware retrieval: filters, chunk resolution, dedup
+│   │   ├── chunk_lookup.py      #   Shared SQL helpers (RetrievedChunk, filters) — both retrieval services use this
+│   │   ├── retrieval_service.py #   Vector-only retrieval (Milestone 2, unchanged)
+│   │   ├── hybrid_retrieval_service.py  # Vector + BM25 + RRF fusion + rerank (Milestone 3)
 │   │   └── chat_service.py      #   The conversational RAG orchestrator (memory→...→response)
 │   ├── rag/                     # RAG pipeline — pure logic, no DB/HTTP
 │   │   ├── ingestion/           #   extraction, cleaning, chunking, hashing (Milestone 1)
 │   │   ├── embeddings/          #   BaseEmbedder interface + Gemini implementation
 │   │   ├── vectorstore/         #   VectorStore interface + FAISS implementation + factory
 │   │   ├── retrieval/
-│   │   │   └── vector_retriever.py  # pure: embed query -> vector_store.search(allowed_ids)
+│   │   │   ├── vector_retriever.py  # pure: embed query -> vector_store.search(allowed_ids)
+│   │   │   ├── bm25_retriever.py    # pure: rank_bm25 over a caller-supplied (id, text) corpus
+│   │   │   ├── fusion.py            # Reciprocal Rank Fusion
+│   │   │   └── dedup.py             # near-duplicate chunk-text detection (shared by both services)
+│   │   ├── reranking/
+│   │   │   ├── base.py              # BaseReranker interface
+│   │   │   ├── cross_encoder_reranker.py  # sentence-transformers cross-encoder (the default)
+│   │   │   └── noop_reranker.py     # passthrough (RERANKER_BACKEND=none)
 │   │   ├── generation/
 │   │   │   ├── base.py          #   BaseChatModel interface + gemini_chat_model.py implementation
 │   │   │   ├── prompts.py       #   every system/user prompt template, in one auditable file
 │   │   │   ├── query_rewriter.py    # LLM call #1: conversation -> standalone query
 │   │   │   └── answer_generator.py  # LLM call #2: query+chunks -> cited answer (streamable)
-│   │   └── dependencies.py      #   cached singletons (embedder, vector store, rewriter, generator)
-│   ├── agents/                  # [empty] GPT agent/router + tools (doc search, web search, calculator)
-│   ├── evaluation/               # [empty] retrieval/faithfulness/correctness evaluation harness
+│   │   └── dependencies.py      #   cached singletons (embedder, vector store, reranker, rewriter, generator)
+│   ├── agents/                  # [empty] LLM agent/router + tools (doc search, web search, calculator)
+│   ├── evaluation/
+│   │   ├── dataset.py           #   14-passage corpus + 22 question/relevant-id pairs
+│   │   ├── metrics.py           #   Recall@k, MRR (pure functions)
+│   │   └── retrieval_benchmark.py  # vector-only vs BM25-only vs hybrid vs hybrid+rerank, measured
 │   ├── database/
 │   │   ├── session.py           #   SQLAlchemy engine/session + init_db()
 │   │   └── models.py            #   DocumentRecord, ChunkRecord, ConversationRecord, MessageRecord
 │   └── utils/                   # small, dependency-free helpers shared across the app
 ├── frontend/
-│   ├── streamlit_app.py         # Chat tab (streamed, cited, filterable) + Documents tab
+│   ├── streamlit_app.py         # Chat tab (streamed, cited, filterable, per-stage diagnostics) + Documents tab
 │   └── api_client.py            #   the only module allowed to call `requests` against the backend
 ├── tests/                       # pytest suite — see §7
 ├── data/, logs/                 # gitignored contents — see Milestone 1 README section
@@ -239,6 +293,39 @@ RAG/
   to `chat_service.py`, `retrieval_service.py`, prompts, or any test's
   assertions — only the provider implementation and the dependency wiring
   in `app/rag/dependencies.py` changed.
+- **Hybrid retrieval is additive, not a rewrite** — `RetrievalService`
+  (vector-only) is untouched; `HybridRetrievalService` is a new, separate
+  class. The only shared code is `app/services/chunk_lookup.py` (SQL
+  filter/lookup helpers, extracted from `RetrievalService` in a pure,
+  behavior-preserving refactor — every Milestone 2 test still passes
+  unchanged) and `app/rag/retrieval/dedup.py` (near-duplicate detection).
+  `ChatService.prepare()` is the only place that branches on
+  `Settings.retrieval_mode`.
+- **Fusion uses rank, not score** — vector cosine similarity and BM25's
+  score live on completely different, incomparable scales. Reciprocal
+  Rank Fusion (`fusion.py`) sidesteps that by only ever looking at each
+  candidate's *position* in each ranked list, never the raw number.
+- **BM25's corpus is rebuilt from SQL per query, not persisted** —
+  `rank_bm25` has no incremental index API (unlike FAISS), so
+  `HybridRetrievalService` loads the matching `ChunkRecord` rows fresh
+  each time and builds a new `BM25Okapi` index. Fine at this project's
+  scale; a documented scaling limit (same honesty as FAISS's exact
+  flat-index tradeoff) for a corpus large enough that this matters — a
+  production system would maintain a persistent, incrementally-updated
+  inverted index (Elasticsearch/OpenSearch/tantivy) instead.
+- **The reranker is a real interface, not a hardcoded model** —
+  `BaseReranker` has two implementations: `CrossEncoderReranker`
+  (sentence-transformers, local, free, the default) and `NoOpReranker`
+  (`RERANKER_BACKEND=none`, a pure passthrough that preserves fusion's
+  order exactly — this is what makes reranking optional rather than
+  load-bearing).
+- **Every hybrid stage's output survives to the API response** —
+  `RetrievalDiagnostics` (`vector_results`, `keyword_results`,
+  `fused_results`, `reranked_results`) is `None` in vector-only mode and
+  fully populated in hybrid mode, visible in both the JSON response and
+  the Streamlit "Retrieval details" expander (one tab per stage) — built
+  for exactly the kind of "why did it retrieve *that*" debugging hybrid
+  pipelines otherwise make opaque.
 
 ---
 
@@ -320,15 +407,17 @@ User Query → Memory → Query Rewrite → Retrieval → Context Selection → 
 ## 4. Roadmap (not yet built — do not assume these exist)
 
 1. ~~**Document ingestion**~~ — done (Milestone 1).
-2. ~~**Core retrieval + generation**~~ — done this milestone.
-3. **Advanced retrieval** — hybrid (vector + BM25) search, reranking.
+2. ~~**Core retrieval + generation**~~ — done (Milestone 2).
+3. ~~**Advanced retrieval**~~ — hybrid (vector + BM25) search + reranking —
+   done this milestone.
 4. **Agent layer** — LLM-based router/tools: document search, web search,
    calculator.
 5. **Memory** — full session management (titles, ownership, expiry) on top
    of the `ConversationRecord`/`MessageRecord` tables already in place.
-6. **Evaluation** — retrieval quality, context relevance, answer
-   correctness, faithfulness/hallucination checks (real calibrated
-   confidence replaces today's heuristic).
+6. **Evaluation** — context relevance, answer correctness,
+   faithfulness/hallucination checks on *generation* (real calibrated
+   confidence replaces today's heuristic) — building on the retrieval
+   benchmark this milestone already added to `app/evaluation/`.
 7. **Productionization** — Docker/Compose, Alembic migrations, CI,
    structured logging, secrets management.
 
@@ -352,8 +441,15 @@ python -m venv .venv
 # macOS/Linux:
 source .venv/bin/activate
 
+# sentence-transformers (the reranker) pulls in torch. Install the small
+# CPU-only wheel first to avoid a multi-GB default download:
+pip install torch --index-url https://download.pytorch.org/whl/cpu
+
 pip install -r requirements-dev.txt   # runtime + test deps
 ```
+
+The cross-encoder reranker model (~90MB) downloads once on first use and
+is cached locally afterward — no network call on subsequent runs.
 
 ### Configure environment
 
@@ -370,6 +466,20 @@ GEMINI_API_KEY=your real key...
 Retrieval/chat defaults worth knowing (all in `.env.example`, all overridable):
 `RETRIEVAL_TOP_K=5`, `MIN_RELEVANCE_SCORE=0.15`, `DEDUP_SIMILARITY_THRESHOLD=0.9`,
 `CONVERSATION_HISTORY_WINDOW=6`.
+
+**Hybrid retrieval is off by default** (`RETRIEVAL_MODE=vector`, the
+unchanged Milestone 2 path). To try it:
+
+```
+RETRIEVAL_MODE=hybrid
+VECTOR_TOP_K=20            # candidates fetched from FAISS
+BM25_TOP_K=20               # candidates fetched from BM25
+RERANK_TOP_K=10             # top fused candidates sent to the reranker
+FINAL_CONTEXT_K=5           # chunks that reach the LLM after rerank + dedup
+RRF_K=60                    # Reciprocal Rank Fusion constant
+RERANKER_BACKEND=cross_encoder   # or "none" to disable reranking
+RERANKER_MODEL=cross-encoder/ms-marco-MiniLM-L-6-v2
+```
 
 ## 6. Running
 
@@ -392,7 +502,9 @@ Open the **Documents** tab first, upload a PDF, wait for `status: completed`.
 Then switch to the **Chat** tab, optionally scope the search to one document
 or document type, and ask a question — the answer streams in with sources,
 confidence, and a "Retrieval details" expander showing exactly what was
-retrieved and how it scored.
+retrieved and how it scored. With `RETRIEVAL_MODE=hybrid` set, that expander
+grows four tabs — Vector / Keyword (BM25) / Fused / Reranked (final) — so
+you can see exactly how each stage changed the ranking.
 
 ## 7. Testing
 
@@ -403,17 +515,25 @@ pytest -v
 | File | Covers |
 |---|---|
 | `tests/test_health.py`, `test_extractor.py`, `test_chunker.py`, `test_hasher.py`, `test_metadata.py`, `test_document_service.py` | Milestones 0–1 (see prior README revisions) |
-| `tests/test_retrieval_service.py` | **Retrieval**: semantic ranking, document-id filter, document-type filter, empty-filter/empty-store behavior, near-duplicate context-selection |
+| `tests/test_retrieval_service.py` | **Retrieval (vector-only)**: semantic ranking, document-id filter, document-type filter, empty-filter/empty-store behavior, near-duplicate context-selection |
 | `tests/test_query_rewriter.py` | **Query rewriting**: no-op on first turn (no LLM call), history-aware rewrite, prompt actually contains history, graceful fallback on LLM failure/blank response |
 | `tests/test_citations.py` | **Citation generation** (pure logic): marker extraction/ordering/dedup, out-of-range marker rejection, no-context-sentinel detection |
-| `tests/test_chat_service.py` | **Citation generation** (integration) + **no-context behavior**: correct index→source mapping, hallucination guard fires without ever calling the generation LLM, model-declines-anyway case forces empty sources, no-citation-markers falls back to crediting all sources, conversational follow-up is actually rewritten using persisted history, document filter is honored end-to-end |
+| `tests/test_chat_service.py` | **Citation generation** (integration) + **no-context behavior** + **retrieval-mode switch**: correct index→source mapping, hallucination guard fires without calling the generation LLM, model-declines-anyway forces empty sources, no-citation-markers falls back to crediting all sources, conversational follow-up is rewritten using persisted history, document filter honored end-to-end, `retrieval_diagnostics` is `None` in vector mode and populated in hybrid mode |
+| `tests/test_bm25_retriever.py` | **BM25**: exact keyword match ranks highest, no-overlap returns empty, top-k limiting, tokenizer behavior |
+| `tests/test_fusion.py` | **Result fusion**: an id found by both engines outranks one found by only one, higher rank within a list scores higher, disjoint/empty-list edge cases, the `k` constant's effect |
+| `tests/test_reranker.py` | **Reranking**: `NoOpReranker` preserves order, the *real* cross-encoder (cached locally, no network) scores a relevant document higher than an irrelevant one and returns sigmoid-normalized [0,1] scores |
+| `tests/test_hybrid_retrieval_service.py` | **Hybrid pipeline integration**: BM25 surfaces an exact term vector search's fixed vocabulary can't represent, fusion favors items both engines found, reranking produces a valid sorted order over real content, `final_context_k` is respected, near-duplicate dedup, metadata-filter/empty-corpus edge cases |
+| `tests/test_evaluation_metrics.py` | Recall@k and MRR (pure functions) |
 
-None of the new tests call the real LLM provider: `tests/fakes.py` provides a
+None of the tests above call the real Gemini API: `tests/fakes.py` provides a
 `KeywordFakeEmbedder` (deterministic, keyword-overlap-based similarity — good
-enough to test ranking/filtering) and a `FakeChatClient` (scripted responses
-for the `.chat.completions.create(...)` surface, streaming and non-streaming).
-**The real Gemini-backed paths are not unit tested** — verify them manually
-with a real key using the test plan below.
+enough to test ranking/filtering) and a `FakeChatModel` (scripted responses
+implementing `BaseChatModel` directly, streaming and non-streaming). The
+cross-encoder reranker tests *do* run the real local model (no network, no
+API key — it's a downloaded-once local model, not a hosted one).
+**The real Gemini-backed paths (embeddings, query rewriting, generation) are
+not unit tested** — verify them manually with a real key using the test plan
+below, or by running the retrieval benchmark (§10).
 
 ## 8. Test plan — verify RAG works correctly
 
@@ -471,10 +591,15 @@ document's topic otherwise).
 12. **Confidence tracks relevance** — compare the `confidence` field between
     a well-covered question (#1) and a borderline/tangential one; confidence
     should be visibly lower for the latter even if it doesn't fully decline.
+13. **Hybrid mode diagnostics** — set `RETRIEVAL_MODE=hybrid` in `.env`,
+    restart the backend, ask a question, and expand "Retrieval details" in
+    Streamlit. You should see four tabs (Vector / Keyword / Fused / Reranked)
+    each with their own scores — confirms the whole pipeline is wired, not
+    just returning the same thing as vector-only under a different label.
 
 ## 9. Verify before moving to the next milestone
 
-- [ ] `pytest -v` passes (48+ tests).
+- [ ] `pytest -v` passes (80+ tests).
 - [ ] A real `GEMINI_API_KEY` is set in `.env`.
 - [ ] At least one PDF uploaded and ingested successfully.
 - [ ] `POST /api/v1/chat` with no documents ingested returns the fixed
@@ -482,10 +607,131 @@ document's topic otherwise).
       chat-completion call billed (only true once something is ingested —
       before that, retrieval also skips embedding the query, see
       `VectorRetriever.search`'s empty-store short-circuit).
-- [ ] Questions 1–12 in the test plan above all behave as described.
+- [ ] Questions 1–13 in the test plan above all behave as described.
 - [ ] `data/processed/metadata.db` shows populated `conversations` and
       `messages` tables after a chat (`sqlite3 data/processed/metadata.db
       "select role, content from messages;"`).
+- [ ] `RETRIEVAL_MODE=vector` still behaves exactly like before this
+      milestone (it's the same code path, untouched).
+- [ ] `python -m app.evaluation.retrieval_benchmark` runs and prints a
+      4-strategy comparison table (§10 below has a real run's output).
 
-Once all of the above are true, core retrieval + generation is confirmed
-working end-to-end and we can start Milestone 3 (hybrid search + reranking).
+Once all of the above are true, hybrid retrieval + reranking is confirmed
+working end-to-end and we can start Milestone 4 (the agent layer).
+
+---
+
+## 10. Hybrid retrieval, explained
+
+### Run the benchmark yourself
+
+```bash
+python -m app.evaluation.retrieval_benchmark
+```
+
+This embeds `app/evaluation/dataset.py`'s 14 passages with the real,
+configured Gemini embedding model, builds a real BM25 index, loads the
+real cross-encoder, and runs all 22 questions through four strategies:
+vector-only, BM25-only, hybrid (fusion, no reranking), and hybrid + rerank.
+It needs a real `GEMINI_API_KEY` — this is a measured experiment against
+live embeddings, not a mocked test.
+
+### A real run's results
+
+```
+Overall (n=22 questions, k=5):
+Strategy             Recall@5     MRR      Total time (s)
+----------------------------------------------------------
+vector-only          1.000        0.955    13.61
+bm25-only            0.864        0.727    0.00
+hybrid (fusion)      0.955        0.789    11.89
+hybrid + rerank      1.000        0.895    14.66
+
+By question category (selected):
+  paraphrase (n=5):        vector 1.000/0.800   bm25 0.400/0.250   fusion 0.800/0.440   rerank 1.000/0.640
+  exact-term (n=2):        vector 1.000/1.000   bm25 1.000/0.200   fusion 1.000/0.333   rerank 1.000/1.000
+  rare-token (n=2):        vector 1.000/1.000   bm25 1.000/1.000   fusion 1.000/1.000   rerank 1.000/1.000
+
+Misses (relevant passage not in top-5): vector-only 0, bm25-only 3
+(all three "paraphrase"), hybrid-fusion 1, hybrid+rerank 0.
+```
+
+**Read honestly, not cherry-picked:** on this small, clean 14-passage
+corpus, vector-only alone already gets perfect Recall@5 — Gemini's
+embeddings are simply strong enough that hybrid fusion *alone* doesn't
+beat it (0.955 vs. 1.000 recall, 0.789 vs. 0.955 MRR): BM25 dragging in
+low-quality paraphrase results sometimes displaces a good vector hit
+before reranking has a chance to fix the order. **Reranking is what
+actually recovers this** — `hybrid + rerank` is the only strategy tied
+for the best recall (1.000, zero misses) while *also* being robust on
+both of BM25's and vector's respective weak spots (see below), which
+neither one alone can guarantee on a different, harder corpus. That
+nuance — hybrid isn't automatically better, reranking is what makes it
+reliably at-least-as-good — is the real, honest finding here.
+
+### Why vector search alone can fail
+
+Embeddings capture *meaning*, which is exactly why they miss two things:
+
+1. **Rare, exact tokens the model has no real association for** — a
+   made-up acronym, a specific error code, an exact product/model name.
+   The embedding space has no strong signal to place it near a document
+   that literally contains it verbatim; a query like "What does the
+   QZ7-Widget need?" only reliably works if the model happens to encode
+   that literal substring similarly, which isn't guaranteed. BM25, which
+   scores literal term overlap, catches this immediately.
+2. **Small or narrow corpora with many similar chunks** — with a lot of
+   near-duplicate or closely related passages (a 95-chunk single paper,
+   say), cosine similarity differences between the truly-best chunk and
+   several near-misses can be tiny, and embedding noise can reorder them.
+   This project's small demo corpus doesn't show this starkly (14
+   diverse, well-separated topics), but it's a well-documented failure
+   mode at real scale — which is exactly why reranking exists.
+
+### Why BM25 helps
+
+BM25 scores *literal term overlap*, weighted by how rare/distinctive each
+term is (inverse document frequency) and normalized for document length.
+It has zero notion of meaning — "car" and "automobile" share no signal —
+but that's precisely its strength for the cases vector search struggles
+with: exact identifiers, jargon, acronyms, numbers, anything where the
+*specific words* matter more than the concept. In this benchmark, BM25
+alone gets every "rare-token" and "exact-term" question right, at
+essentially zero latency (no API call, no model — pure arithmetic over
+term counts already in memory).
+
+### Why reranking helps
+
+A cross-encoder reads the query and a candidate document *together*,
+through one model pass, so it can weigh interactions between specific
+words in both — something a bi-encoder (vector search) fundamentally
+can't do, since it must compress the query and every document into
+independent, fixed vectors *before* ever seeing them side by side. That
+joint attention is why cross-encoders are consistently more accurate at
+judging "is this actually relevant" — and why they're too slow to run
+over an entire corpus (one model pass per candidate), which is exactly
+why they only ever run over a short fused shortlist, not the whole
+index. In this benchmark, reranking is what turns fusion's 1 miss back
+into 0 — it correctly demotes the low-quality BM25-sourced result that
+naive rank fusion let outrank a better vector hit.
+
+### When hybrid retrieval is actually useful
+
+- **Your queries mix styles** — some users ask in exact keywords/jargon,
+  others paraphrase conversationally. No single retriever handles both
+  well; fusion means you don't have to predict which kind a query is
+  before choosing a strategy.
+- **Your corpus has rare, load-bearing exact terms** — product codes,
+  acronyms, specific names, numbers — that users will plausibly search
+  for verbatim, and that a general-purpose embedding model was never
+  trained to treat as meaningfully distinct from similar-looking terms.
+- **Your corpus is large and/or topically narrow** — many chunks
+  discussing similar things, where vector similarity alone becomes noisy
+  and reranking's precision matters more than it does on a small, diverse
+  corpus like this benchmark's.
+- **It's *not* obviously worth it** when your corpus is small, clean, and
+  your embedding model is already strong for the domain (this benchmark's
+  own vector-only column) — the honest result above. Hybrid + reranking
+  is a reliability/robustness upgrade more than a guaranteed win on every
+  corpus; `RETRIEVAL_MODE=vector` staying fully intact and swappable is
+  exactly what lets you measure that for your own data before deciding.

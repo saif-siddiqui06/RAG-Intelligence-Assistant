@@ -29,6 +29,18 @@ class SourceCitation(BaseModel):
     chunk_id: str
 
 
+class RetrievalDiagnostics(BaseModel):
+    """Per-stage output of the hybrid retrieval pipeline, for
+    development/debugging — only populated when RETRIEVAL_MODE=hybrid;
+    None in vector-only mode.
+    """
+
+    vector_results: list[RetrievedChunkOut]
+    keyword_results: list[RetrievedChunkOut]
+    fused_results: list[RetrievedChunkOut]
+    reranked_results: list[RetrievedChunkOut]
+
+
 class ChatResponse(BaseModel):
     answer: str
     sources: list[SourceCitation]
@@ -36,6 +48,7 @@ class ChatResponse(BaseModel):
     confidence: str
     rewritten_query: str
     session_id: str
+    retrieval_diagnostics: RetrievalDiagnostics | None = None
 
 
 class ChatStreamMeta(BaseModel):
@@ -49,3 +62,4 @@ class ChatStreamMeta(BaseModel):
     confidence: str
     rewritten_query: str
     session_id: str
+    retrieval_diagnostics: RetrievalDiagnostics | None = None

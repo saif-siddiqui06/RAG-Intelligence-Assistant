@@ -200,3 +200,45 @@ def test_document_filter_is_applied_to_chat_requests(
     response = service.ask(ChatRequest(question="What is SMOTE?", document_id=smote_doc.id))
 
     assert all(c.document_id == smote_doc.id for c in response.retrieved_chunks)
+
+
+def test_vector_mode_leaves_retrieval_diagnostics_none(
+    db_session, settings, embedder, vector_store, monkeypatch
+):
+    """RETRIEVAL_MODE=vector (the default) is the unchanged Milestone 2
+    path — it must never populate diagnostics, which only the hybrid
+    path produces.
+    """
+    _seed_smote_document(db_session, vector_store, embedder)
+    chat_model = FakeChatModel(responses=["SMOTE oversamples the minority class [1]."])
+    _patch_dependencies(monkeypatch, embedder, vector_store, chat_model)
+
+    service = ChatService(db_session, settings)
+    response = service.ask(ChatRequest(question="What is SMOTE?"))
+
+    assert response.retrieval_diagnostics is None
+
+
+def test_hybrid_mode_populates_retrieval_diagnostics(
+    db_session, settings, embedder, vector_store, monkeypatch
+):
+    """RETRIEVAL_MODE=hybrid runs vector + BM25 + fusion + rerank and
+    must surface every stage's output for development/debugging.
+    """
+    from app.rag.reranking.noop_reranker import NoOpReranker
+
+    settings.retrieval_mode = "hybrid"
+    _seed_smote_document(db_session, vector_store, embedder)
+    chat_model = FakeChatModel(responses=["SMOTE oversamples the minority class [1]."])
+    _patch_dependencies(monkeypatch, embedder, vector_store, chat_model)
+    monkeypatch.setattr(chat_service_module, "get_reranker", lambda: NoOpReranker())
+
+    service = ChatService(db_session, settings)
+    response = service.ask(ChatRequest(question="What is SMOTE?"))
+
+    diagnostics = response.retrieval_diagnostics
+    assert diagnostics is not None
+    assert diagnostics.vector_results
+    assert diagnostics.fused_results
+    assert diagnostics.reranked_results
+    assert len(response.retrieved_chunks) <= settings.final_context_k
