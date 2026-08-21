@@ -36,8 +36,8 @@ class Settings(BaseSettings):
 
     # --- Gemini (Google AI Studio — free tier, no credit card required) ---
     gemini_api_key: str = ""
-    gemini_model: str = "gemini-2.5-flash"
-    embedding_model: str = "text-embedding-004"
+    gemini_model: str = "gemini-3.6-flash"
+    embedding_model: str = "gemini-embedding-2"
 
     # --- Database ---
     # SQLite by default so ingestion works with zero extra infra. Swap to a

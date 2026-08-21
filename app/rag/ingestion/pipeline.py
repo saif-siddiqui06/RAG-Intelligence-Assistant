@@ -65,6 +65,15 @@ class IngestionPipeline:
 
         texts = [item[2] for item in pending]
         vectors = self.embedder.embed_documents(texts)
+        if len(vectors) != len(texts):
+            # zip() below would otherwise silently truncate to the shorter
+            # list — that's exactly how a provider bug once turned a
+            # 37-page document into a single stored chunk with no error.
+            raise AppException(
+                f"Embedder returned {len(vectors)} vectors for {len(texts)} chunks — "
+                "refusing to continue with misaligned data.",
+                status_code=502,
+            )
         vector_ids = self.vector_store.add(vectors)
 
         chunks = [
