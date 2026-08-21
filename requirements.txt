@@ -17,3 +17,5 @@ rank_bm25>=0.2.2,<0.3
 #   pip install torch --index-url https://download.pytorch.org/whl/cpu
 sentence-transformers>=3.0,<4.0
 ddgs>=9.0,<10.0
+alembic>=1.13,<2.0
+slowapi>=0.1.9,<0.2

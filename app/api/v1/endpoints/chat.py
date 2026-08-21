@@ -8,12 +8,13 @@ app.services.chat_service.STREAM_META_DELIMITER for the exact protocol.
 """
 import logging
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Request
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_app_settings, get_db
-from app.core.config import Settings
+from app.core.config import Settings, get_settings
+from app.core.rate_limit import limiter
 from app.models.chat import ChatRequest, ChatResponse
 from app.services.chat_service import ChatService
 
@@ -22,17 +23,21 @@ router = APIRouter(prefix="/chat", tags=["chat"])
 
 
 @router.post("", response_model=ChatResponse)
+@limiter.limit(get_settings().rate_limit_default)
 def ask(
-    request: ChatRequest,
+    request: Request,
+    chat_request: ChatRequest,
     db: Session = Depends(get_db),
     settings: Settings = Depends(get_app_settings),
 ) -> ChatResponse:
-    return ChatService(db, settings).ask(request)
+    return ChatService(db, settings).ask(chat_request)
 
 
 @router.post("/stream")
+@limiter.limit(get_settings().rate_limit_default)
 def ask_stream(
-    request: ChatRequest,
+    request: Request,
+    chat_request: ChatRequest,
     db: Session = Depends(get_db),
     settings: Settings = Depends(get_app_settings),
 ) -> StreamingResponse:
@@ -41,7 +46,7 @@ def ask_stream(
     # point) run here, synchronously, so a failure raises a normal
     # exception the registered handlers turn into a clean JSON error
     # *before* the streaming response starts.
-    prepared = service.prepare(request)
+    prepared = service.prepare(chat_request)
     return StreamingResponse(
         service.stream_answer(prepared), media_type="text/plain; charset=utf-8"
     )

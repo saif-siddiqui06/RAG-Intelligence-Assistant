@@ -70,6 +70,13 @@ class DocumentService:
         if not raw_bytes:
             raise AppException("Uploaded file is empty", status_code=400)
 
+        max_bytes = self.settings.max_upload_size_mb * 1024 * 1024
+        if len(raw_bytes) > max_bytes:
+            raise AppException(
+                f"File exceeds the {self.settings.max_upload_size_mb}MB upload limit",
+                status_code=413,
+            )
+
         file_hash = compute_file_hash(raw_bytes)
         existing = self.db.scalar(select(DocumentRecord).where(DocumentRecord.file_hash == file_hash))
         if existing:

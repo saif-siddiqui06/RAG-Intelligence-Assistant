@@ -76,6 +76,15 @@ class Settings(BaseSettings):
     web_search_max_results: int = 5
     summary_max_chars: int = 12000  # chunk content budget fed to the summarizer per document
 
+    # --- Production hardening (Milestone 6) ---
+    log_format: str = "text"  # "text" | "json" (structured logging for log aggregators)
+    max_upload_size_mb: int = 25
+    rate_limit_default: str = "60/minute"  # applied to chat/agent endpoints
+    rate_limit_upload: str = "10/minute"
+    # Low on purpose: the benchmark makes ~20+ real Gemini embedding calls
+    # per run, against a 20/day free-tier quota (see README limitations).
+    rate_limit_evaluation: str = "3/hour"
+
     # --- Storage paths ---
     upload_dir: Path = BASE_DIR / "data" / "uploads"
     processed_dir: Path = BASE_DIR / "data" / "processed"

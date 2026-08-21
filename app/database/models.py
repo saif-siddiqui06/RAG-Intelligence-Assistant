@@ -1,7 +1,7 @@
-"""SQLAlchemy ORM models for document/chunk metadata.
+"""SQLAlchemy ORM models for document/conversation metadata.
 
-Deliberately separate from `app.models.schemas` (the Pydantic API
-contracts) — these describe on-disk rows, not HTTP payloads.
+Deliberately separate from `app.models.*` (the Pydantic API contracts)
+— these describe on-disk rows, not HTTP payloads.
 """
 import uuid
 from datetime import datetime, timezone
@@ -63,18 +63,37 @@ class ChunkRecord(Base):
     document: Mapped["DocumentRecord"] = relationship(back_populates="chunks")
 
 
-class ConversationRecord(Base):
-    """One row per chat session. Deliberately minimal today — the full
-    session-management milestone (titles, per-user ownership, expiry)
-    lands later; this just gives query rewriting somewhere durable to
-    read prior turns from.
+class UserRecord(Base):
+    """Minimal user record — this project has no auth system yet, so
+    every conversation is owned by one auto-provisioned default user
+    (see app.services.conversation_service.get_or_create_default_user).
+    The schema is shaped for real multi-user auth to slot in later
+    without a conversations/messages table change.
     """
+
+    __tablename__ = "users"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_id)
+    email: Mapped[str] = mapped_column(String(255), unique=True, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+
+    conversations: Mapped[list["ConversationRecord"]] = relationship(back_populates="user")
+
+
+class ConversationRecord(Base):
+    """One row per chat session."""
 
     __tablename__ = "conversations"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_id)
+    user_id: Mapped[str | None] = mapped_column(ForeignKey("users.id"), nullable=True, index=True)
+    title: Mapped[str | None] = mapped_column(String(255), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow
+    )
 
+    user: Mapped["UserRecord | None"] = relationship(back_populates="conversations")
     messages: Mapped[list["MessageRecord"]] = relationship(
         back_populates="conversation",
         cascade="all, delete-orphan",
@@ -97,3 +116,24 @@ class MessageRecord(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
 
     conversation: Mapped["ConversationRecord"] = relationship(back_populates="messages")
+    sources: Mapped[list["MessageSourceRecord"]] = relationship(
+        back_populates="message", cascade="all, delete-orphan"
+    )
+
+
+class MessageSourceRecord(Base):
+    """One row per citation attached to an assistant message — persisted
+    so past conversations still show their sources, not just the live
+    response. Only ever attached to "assistant"-role messages.
+    """
+
+    __tablename__ = "message_sources"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_id)
+    message_id: Mapped[str] = mapped_column(ForeignKey("messages.id"), index=True)
+    index: Mapped[int] = mapped_column(Integer)  # matches the [n] marker in the message content
+    document_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    page_number: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    chunk_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+
+    message: Mapped["MessageRecord"] = relationship(back_populates="sources")

@@ -12,6 +12,9 @@ import requests
 API_BASE_URL = os.getenv("API_BASE_URL", "http://localhost:8000")
 _DOCUMENTS_URL = f"{API_BASE_URL}/api/v1/documents"
 _CHAT_URL = f"{API_BASE_URL}/api/v1/chat"
+_AGENT_URL = f"{API_BASE_URL}/api/v1/agent"
+_CONVERSATIONS_URL = f"{API_BASE_URL}/api/v1/conversations"
+_EVALUATION_URL = f"{API_BASE_URL}/api/v1/evaluation"
 
 # Must match app.services.chat_service.STREAM_META_DELIMITER exactly —
 # frontend and backend are separate deployables, so this can't be a
@@ -155,6 +158,56 @@ def ask_chat_stream(
             result["error"] = "Could not parse response metadata"
 
     return _generate(), result
+
+
+def run_agent(
+    query: str,
+    session_id: str | None = None,
+    document_id: str | None = None,
+    document_type: str | None = None,
+) -> dict:
+    """Non-streaming: the LLM picks tools (web search, calculator,
+    document summary, document search) itself. Returns
+    {answer, tools_used, sources, reasoning_summary, execution_time}.
+    """
+    payload: dict = {"query": query}
+    if session_id:
+        payload["session_id"] = session_id
+    if document_id:
+        payload["document_id"] = document_id
+    if document_type:
+        payload["document_type"] = document_type
+    response = requests.post(_AGENT_URL, json=payload, timeout=120)
+    response.raise_for_status()
+    return response.json()
+
+
+def list_conversations() -> list[dict]:
+    response = requests.get(_CONVERSATIONS_URL, timeout=10)
+    response.raise_for_status()
+    return response.json()
+
+
+def get_conversation(conversation_id: str) -> dict:
+    response = requests.get(f"{_CONVERSATIONS_URL}/{conversation_id}", timeout=10)
+    response.raise_for_status()
+    return response.json()
+
+
+def delete_conversation(conversation_id: str) -> dict:
+    response = requests.delete(f"{_CONVERSATIONS_URL}/{conversation_id}", timeout=10)
+    response.raise_for_status()
+    return response.json()
+
+
+def run_evaluation_benchmark() -> dict:
+    """Triggers the retrieval benchmark (~20+ real Gemini calls, so the
+    backend rate-limits this to a few runs per hour). Can take a while
+    the first time (loads the cross-encoder model).
+    """
+    response = requests.post(f"{_EVALUATION_URL}/benchmark", timeout=300)
+    response.raise_for_status()
+    return response.json()
 
 
 def api_error_detail(exc: requests.exceptions.HTTPError) -> str:

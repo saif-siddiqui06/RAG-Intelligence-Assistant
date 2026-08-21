@@ -25,13 +25,15 @@ error *before* a streaming response has started. Only the LLM answer
 call itself streams — that's the one place a "mid-response" failure is
 actually unavoidable, since it's the thing being streamed.
 """
+import logging
 from collections.abc import Iterator
 from dataclasses import dataclass
+from datetime import datetime, timezone
 
 from sqlalchemy.orm import Session
 
 from app.core.config import Settings
-from app.database.models import ConversationRecord, MessageRecord
+from app.database.models import ConversationRecord, MessageRecord, MessageSourceRecord
 from app.models.chat import (
     ChatRequest,
     ChatResponse,
@@ -42,6 +44,7 @@ from app.models.chat import (
 )
 from app.rag.dependencies import (
     get_answer_generator,
+    get_chat_model,
     get_query_rewriter,
     get_reranker,
     get_vector_retriever,
@@ -49,10 +52,14 @@ from app.rag.dependencies import (
 from app.rag.generation.answer_generator import extract_cited_indices, is_no_context_answer
 from app.rag.generation.prompts import NO_CONTEXT_SENTINEL
 from app.services.chunk_lookup import RetrievedChunk
+from app.services.conversation_service import get_or_create_default_user
 from app.services.hybrid_retrieval_service import HybridRetrievalResult, HybridRetrievalService
 from app.services.retrieval_service import RetrievalService
 
+logger = logging.getLogger(__name__)
+
 STREAM_META_DELIMITER = "\n<<<META>>>\n"
+_MAX_TITLE_LENGTH = 60
 
 
 @dataclass
@@ -110,7 +117,7 @@ class ChatService:
         diagnostics_out = _to_diagnostics_out(prepared.diagnostics)
 
         if not prepared.relevant:
-            self._persist_turn(prepared.conversation, prepared.original_question, NO_CONTEXT_SENTINEL)
+            self._persist_turn(prepared.conversation, prepared.original_question, NO_CONTEXT_SENTINEL, [])
             return ChatResponse(
                 answer=NO_CONTEXT_SENTINEL,
                 sources=[],
@@ -123,7 +130,7 @@ class ChatService:
 
         answer_text = self.answer_generator.generate(prepared.rewritten_query, prepared.relevant)
         sources, confidence = self._finalize(answer_text, prepared.relevant)
-        self._persist_turn(prepared.conversation, prepared.original_question, answer_text)
+        self._persist_turn(prepared.conversation, prepared.original_question, answer_text, sources)
 
         return ChatResponse(
             answer=answer_text,
@@ -155,7 +162,7 @@ class ChatService:
             answer_text = "".join(parts)
             sources, confidence = self._finalize(answer_text, prepared.relevant)
 
-        self._persist_turn(prepared.conversation, prepared.original_question, answer_text)
+        self._persist_turn(prepared.conversation, prepared.original_question, answer_text, sources)
 
         meta = ChatStreamMeta(
             sources=sources,
@@ -215,9 +222,12 @@ class ChatService:
             existing = self.db.get(ConversationRecord, session_id)
             if existing:
                 return existing
-            conversation = ConversationRecord(id=session_id)
+
+        user = get_or_create_default_user(self.db)
+        if session_id:
+            conversation = ConversationRecord(id=session_id, user_id=user.id)
         else:
-            conversation = ConversationRecord()
+            conversation = ConversationRecord(user_id=user.id)
         self.db.add(conversation)
         self.db.commit()
         self.db.refresh(conversation)
@@ -232,12 +242,59 @@ class ChatService:
         recent = conversation.messages[-window:] if window > 0 else []
         return [(m.role, m.content) for m in recent]
 
-    def _persist_turn(self, conversation: ConversationRecord, question: str, answer: str) -> None:
+    def _persist_turn(
+        self,
+        conversation: ConversationRecord,
+        question: str,
+        answer: str,
+        sources: list[SourceCitation],
+    ) -> None:
+        is_first_turn = not conversation.messages
+
         self.db.add(MessageRecord(conversation_id=conversation.id, role="user", content=question))
-        self.db.add(
-            MessageRecord(conversation_id=conversation.id, role="assistant", content=answer)
+        assistant_message = MessageRecord(
+            conversation_id=conversation.id, role="assistant", content=answer
         )
+        self.db.add(assistant_message)
+        self.db.flush()  # assigns assistant_message.id for the source rows below
+
+        for source in sources:
+            self.db.add(
+                MessageSourceRecord(
+                    message_id=assistant_message.id,
+                    index=source.index,
+                    document_name=source.document_name,
+                    page_number=source.page_number,
+                    chunk_id=source.chunk_id,
+                )
+            )
+
+        if is_first_turn and not conversation.title:
+            conversation.title = self._generate_title(question)
+        conversation.updated_at = datetime.now(timezone.utc)
         self.db.commit()
+
+    def _generate_title(self, question: str) -> str:
+        """Best-effort — falls back to a truncated question on any LLM
+        failure (e.g. a rate limit) rather than blocking the response.
+        """
+        fallback = question if len(question) <= 50 else question[:50] + "..."
+        try:
+            messages = [
+                {
+                    "role": "user",
+                    "content": (
+                        "Write a short, plain-text title (4-8 words, no quotes, no "
+                        f"trailing punctuation) for a conversation that starts with "
+                        f"this question:\n\n{question}"
+                    ),
+                }
+            ]
+            title = get_chat_model().complete(messages, temperature=0).strip().strip("\"'")
+            return title[:_MAX_TITLE_LENGTH] if title else fallback
+        except Exception:
+            logger.exception("Conversation title generation failed; using a fallback title")
+            return fallback
 
 
 def _to_chunk_out(chunk: RetrievedChunk) -> RetrievedChunkOut:

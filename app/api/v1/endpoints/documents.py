@@ -7,11 +7,12 @@ want an async task queue later.
 """
 import logging
 
-from fastapi import APIRouter, Depends, File, Query, UploadFile
+from fastapi import APIRouter, Depends, File, Query, Request, UploadFile
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_app_settings, get_db
-from app.core.config import Settings
+from app.core.config import Settings, get_settings
+from app.core.rate_limit import limiter
 from app.models.document import (
     ChunkPreview,
     DeleteResponse,
@@ -26,7 +27,9 @@ router = APIRouter(prefix="/documents", tags=["documents"])
 
 
 @router.post("/upload", response_model=list[DocumentMetadataResponse], status_code=201)
+@limiter.limit(get_settings().rate_limit_upload)
 def upload_documents(
+    request: Request,
     files: list[UploadFile] = File(..., description="One or more PDF files"),
     chunk_size: int | None = Query(default=None, gt=0),
     chunk_overlap: int | None = Query(default=None, ge=0),

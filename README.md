@@ -9,12 +9,13 @@ This repository is built **incrementally, milestone by milestone**. This
 README reflects the current milestone and will be updated as each new one
 lands.
 
-> **Current milestone: 4 — Agent Layer.**
-> A tool-using agent sits in front of the RAG pipeline: it decides — per
-> query — whether to search the uploaded documents, search the web,
-> run a calculation, summarize a document, some combination, or answer
-> directly. Structured tool inputs, per-tool timeouts, a max-iteration
-> cap, and a safe, chain-of-thought-free response. See [§11](#11-agent-explained--10-example-queries).
+> **Current milestone: 6 — Productionization.**
+> Docker + docker-compose (backend, frontend, PostgreSQL), structured
+> logging with per-request IDs, slowapi rate limiting, upload
+> validation, an enhanced DB-aware health check, Alembic migrations,
+> and a multi-page Streamlit UI (Chat, Documents, Evaluation,
+> Settings). See [§12](#12-milestone-5--conversational-memory) and
+> [§13](#13-milestone-6--productionization).
 
 ---
 
@@ -223,23 +224,29 @@ RAG/
 │   │           ├── health.py    #   GET /health
 │   │           ├── documents.py #   document upload/list/get/delete/reindex/chunks/stats
 │   │           ├── chat.py      #   POST /chat, POST /chat/stream
-│   │           └── agent.py     #   POST /agent
+│   │           ├── agent.py     #   POST /agent
+│   │           ├── conversations.py  # conversation create/list/get/delete (Milestone 5)
+│   │           └── evaluation.py     # POST /evaluation/benchmark (Milestone 6)
 │   ├── core/
-│   │   ├── config.py            #   Settings: app, DB, chunking, retrieval, confidence thresholds
-│   │   ├── logging.py           #   logging.dictConfig setup (console + rotating file)
+│   │   ├── config.py            #   Settings: app, DB, chunking, retrieval, rate limits, logging (Milestone 6)
+│   │   ├── logging.py           #   logging.dictConfig — text or JSON formatter, request-id filter
+│   │   ├── request_id.py        #   X-Request-ID middleware + contextvar + logging filter (Milestone 6)
+│   │   ├── rate_limit.py        #   shared slowapi Limiter instance (Milestone 6)
 │   │   └── exceptions.py        #   AppException hierarchy + FastAPI error handlers
 │   ├── models/                  # Pydantic schemas (API contracts), not ORM models
-│   │   ├── schemas.py           #   HealthResponse
+│   │   ├── schemas.py           #   HealthResponse (now includes DB connectivity)
 │   │   ├── document.py          #   Document/Chunk/Stats request-response schemas
 │   │   ├── chat.py              #   ChatRequest/ChatResponse/SourceCitation/ChatStreamMeta
-│   │   └── agent.py             #   AgentRequest/AgentResponse/ToolSourceOut
+│   │   ├── agent.py             #   AgentRequest/AgentResponse/ToolSourceOut
+│   │   └── conversation.py      #   ConversationSummary/Detail, MessageOut, MessageSourceOut (Milestone 5)
 │   ├── services/
 │   │   ├── document_service.py  #   Orchestrates rag/ingestion + database for documents
 │   │   ├── chunk_lookup.py      #   Shared SQL helpers (RetrievedChunk, filters) — both retrieval services use this
 │   │   ├── retrieval_service.py #   Vector-only retrieval (Milestone 2, unchanged)
 │   │   ├── hybrid_retrieval_service.py  # Vector + BM25 + RRF fusion + rerank (Milestone 3)
-│   │   ├── chat_service.py      #   The conversational RAG orchestrator (memory→...→response)
-│   │   └── agent_service.py     #   Builds the 4 tools per-request, runs AgentOrchestrator (Milestone 4)
+│   │   ├── chat_service.py      #   The conversational RAG orchestrator (memory→...→response); persists titles + sources (Milestone 5)
+│   │   ├── agent_service.py     #   Builds the 4 tools per-request, runs AgentOrchestrator (Milestone 4)
+│   │   └── conversation_service.py  # Conversation CRUD + default-user provisioning (Milestone 5)
 │   ├── rag/                     # RAG pipeline — pure logic, no DB/HTTP
 │   │   ├── ingestion/           #   extraction, cleaning, chunking, hashing (Milestone 1)
 │   │   ├── embeddings/          #   BaseEmbedder interface + Gemini implementation
@@ -270,16 +277,23 @@ RAG/
 │   │   ├── metrics.py           #   Recall@k, MRR (pure functions)
 │   │   └── retrieval_benchmark.py  # vector-only vs BM25-only vs hybrid vs hybrid+rerank, measured
 │   ├── database/
-│   │   ├── session.py           #   SQLAlchemy engine/session + init_db()
-│   │   └── models.py            #   DocumentRecord, ChunkRecord, ConversationRecord, MessageRecord
+│   │   ├── session.py           #   SQLAlchemy engine/session + init_db() (Alembic-owned in production, Milestone 6)
+│   │   └── models.py            #   DocumentRecord, ChunkRecord, UserRecord, ConversationRecord, MessageRecord, MessageSourceRecord
 │   └── utils/                   # small, dependency-free helpers shared across the app
+├── migrations/                  # Alembic (Milestone 5) — env.py wired to Settings.database_url + Base.metadata
+│   └── versions/86de312205ca_initial_schema.py
 ├── frontend/
-│   ├── streamlit_app.py         # Chat tab (streamed, cited, filterable, per-stage diagnostics) + Documents tab
+│   ├── streamlit_app.py         # Chat page: mode toggle (Direct RAG stream / Agent), conversation history sidebar (Milestone 6)
+│   ├── pages/
+│   │   ├── 1_Documents.py       #   upload/list/preview/reindex/delete (Milestone 6 — moved out of the Chat page)
+│   │   ├── 2_Evaluation.py      #   button-triggered retrieval benchmark + failed-query breakdown (Milestone 6)
+│   │   └── 3_Settings.py        #   read-only backend/health/storage diagnostics (Milestone 6)
 │   └── api_client.py            #   the only module allowed to call `requests` against the backend
 ├── tests/                       # pytest suite — see §7
 ├── data/, logs/                 # gitignored contents — see Milestone 1 README section
+├── Dockerfile, frontend/Dockerfile, docker-compose.yml, .dockerignore   # Milestone 6
 ├── requirements.txt / requirements-dev.txt
-├── pytest.ini / .env.example / .gitignore
+├── pytest.ini / alembic.ini / .env.example / .gitignore
 ```
 
 **Why this layout (additions this milestone):**
@@ -450,18 +464,35 @@ User Query → Memory → Query Rewrite → Retrieval → Context Selection → 
    done this milestone.
 4. ~~**Agent layer**~~ — LLM-based tool-selecting agent (document search,
    web search, calculator, document summary) — done this milestone.
-5. **Memory** — full session management (titles, ownership, expiry) on top
-   of the `ConversationRecord`/`MessageRecord` tables already in place.
-6. **Evaluation** — context relevance, answer correctness,
-   faithfulness/hallucination checks on *generation* (real calibrated
-   confidence replaces today's heuristic) — building on the retrieval
-   benchmark this milestone already added to `app/evaluation/`.
-7. **Productionization** — Docker/Compose, Alembic migrations, CI,
-   structured logging, secrets management.
+5. ~~**Memory**~~ — full session management (titles, `User`/`MessageSource`
+   tables, conversation CRUD API, Alembic migrations) — done (Milestone 5,
+   see [§12](#12-milestone-5--conversational-memory)).
+6. **Evaluation** — the retrieval-quality benchmark (§10) is exposed via
+   `POST /api/v1/evaluation/benchmark` and the Evaluation UI page, but
+   answer correctness / faithfulness scoring on *generation* (replacing
+   today's heuristic confidence with something calibrated) is still not
+   built — still an honestly-empty gap, not a hidden one.
+7. ~~**Productionization**~~ — Docker/Compose, Alembic migrations,
+   structured logging + request IDs, rate limiting, file validation,
+   multi-page UI — done (Milestone 6, see
+   [§13](#13-milestone-6--productionization)). CI is not set up.
 
 ---
 
 ## 5. Setup
+
+### Quick start with Docker (backend + frontend + PostgreSQL)
+
+```bash
+cp .env.example .env    # fill in a real GEMINI_API_KEY
+docker compose up --build
+```
+
+Frontend: http://localhost:8501 · Backend docs: http://localhost:8000/docs
+— see [§13](#13-milestone-6--productionization) for what each service does.
+Everything below this point is the **local, no-Docker** setup (SQLite,
+run backend/frontend as separate processes) — still fully supported and
+what the test suite uses.
 
 ### Prerequisites
 
@@ -553,13 +584,15 @@ uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 streamlit run frontend/streamlit_app.py
 ```
 
-Open the **Documents** tab first, upload a PDF, wait for `status: completed`.
-Then switch to the **Chat** tab, optionally scope the search to one document
-or document type, and ask a question — the answer streams in with sources,
-confidence, and a "Retrieval details" expander showing exactly what was
-retrieved and how it scored. With `RETRIEVAL_MODE=hybrid` set, that expander
-grows four tabs — Vector / Keyword (BM25) / Fused / Reranked (final) — so
-you can see exactly how each stage changed the ranking.
+This is a multi-page app (Streamlit's native `pages/` directory) — the
+sidebar has links to **Documents**, **Evaluation** and **Settings**, and
+the "Chat" page loaded by default. Open **Documents** first, upload a
+PDF, wait for `status: completed`. Then on **Chat**, pick 💬 Direct RAG
+(streamed answer, citations, confidence, a "Retrieval details" expander
+— four tabs instead of one if `RETRIEVAL_MODE=hybrid`) or 🤖 Agent
+(non-streaming, shows which tool(s) were used, their sources, and a
+reasoning summary). Use **New conversation** / **Conversation history**
+in the sidebar to start fresh or reload/delete a past conversation.
 
 ## 7. Testing
 
@@ -583,6 +616,8 @@ pytest -v
 | `tests/test_agent_parsing.py` | **Action parsing**: plain JSON, markdown-fenced JSON, JSON embedded in surrounding text, missing-action/garbage → `None`, `reasoning_summary` matches the exact example format and never leaks tool input text |
 | `tests/test_agent_orchestrator.py` | **Tool selection + execution**: the model's named tool is called with its exact input, multi-tool (compound) queries call tools in order, sources aggregate across tools, unknown-tool/tool-exception/tool-timeout are all caught and fed back as observations without crashing, max-iterations triggers the fallback instead of hanging, unparseable model output is treated as the final answer, reasoning_summary never contains raw model text |
 | `tests/test_document_tools.py` | **document_search_tool / document_summary_tool** integration: grounded answer + sources via the real `ChatService` (fakes for the LLM/embedder), summarize-by-filename, not-found handling |
+| `tests/test_conversation_service.py` | **Conversation CRUD** (Milestone 5): default-user idempotency, create/list/get/delete, missing-conversation `NotFoundError`, first-turn title generation + source persistence, graceful title-generation fallback on LLM failure |
+| `tests/test_production_hardening.py` | **Milestone 6 hardening**: `X-Request-ID` present on every response and echoed back when supplied, non-PDF upload rejected (415), oversized upload rejected (413) at both the HTTP and `DocumentService` layers, the upload endpoint's rate limit actually trips (429) |
 
 None of the tests above call the real Gemini API: `tests/fakes.py` provides a
 `KeywordFakeEmbedder` (deterministic, keyword-overlap-based similarity — good
@@ -674,7 +709,7 @@ document's topic otherwise).
       milestone (it's the same code path, untouched).
 - [ ] `python -m app.evaluation.retrieval_benchmark` runs and prints a
       4-strategy comparison table (§10 below has a real run's output).
-- [ ] `pytest -v` passes (114+ tests, including the new agent suite).
+- [ ] `pytest -v` passes (125+ tests, including the agent, conversation and production-hardening suites).
 - [ ] `POST /api/v1/agent` with `{"query": "What is 17.5% of 850?"}` returns
       `tools_used: ["calculator_tool"]` and the correct number.
 - [ ] The same endpoint with a question about an uploaded document returns
@@ -867,3 +902,355 @@ naive rank fusion let outrank a better vector hit.
   is a reliability/robustness upgrade more than a guaranteed win on every
   corpus; `RETRIEVAL_MODE=vector` staying fully intact and swappable is
   exactly what lets you measure that for your own data before deciding.
+
+---
+
+## 12. Milestone 5 — Conversational Memory
+
+Session/conversation plumbing (bounded history, follow-up rewriting)
+already existed from Milestone 2. This milestone added the parts needed
+for *real* multi-conversation memory: who owns a conversation, what it's
+called, per-message citation history, and a CRUD API + real migration
+tooling to manage the schema going forward.
+
+### Database schema (new/changed tables)
+
+| Table | Key columns | Purpose |
+|---|---|---|
+| `users` | `id`, `email` (unique) | One row per user. No auth system yet — every conversation is owned by a single auto-provisioned `default-user@local` (`get_or_create_default_user`); the schema is shaped so real auth can slot in later without another migration. |
+| `conversations` | `id`, `user_id` (FK), `title`, `created_at`, `updated_at` | `title` is auto-generated from the first question (`ChatService._generate_title`, one extra short LLM call) and falls back to a truncated question on any LLM failure. `updated_at` bumps on every turn — this is what conversation-history sorts by. |
+| `messages` | `id`, `conversation_id` (FK), `role`, `content`, `created_at` | Unchanged shape from Milestone 2. |
+| `message_sources` | `id`, `message_id` (FK), `index`, `document_name`, `page_number`, `chunk_id` | New: persists each citation attached to an assistant message, so re-opening an old conversation still shows its real sources instead of only the live response's. |
+
+### API endpoints
+
+| Method & path | Purpose |
+|---|---|
+| `POST /api/v1/conversations` | Create an empty conversation, returns its id. |
+| `GET /api/v1/conversations` | List all conversations (id, title, timestamps, message count), newest-updated first. |
+| `GET /api/v1/conversations/{id}` | Full detail: every message, each with its persisted sources. |
+| `DELETE /api/v1/conversations/{id}` | Delete a conversation (cascades to its messages and their sources). |
+
+There's no separate "continue a conversation" endpoint — pass the
+conversation's id as `session_id` to `POST /chat` or `/chat/stream`
+exactly as before; `ChatService` finds the existing `ConversationRecord`
+and appends to it.
+
+### Migrations (Alembic)
+
+This is the first schema change that *alters* an already-existing table
+(`conversations` gains `user_id`/`title`/`updated_at`) rather than only
+adding new ones, so `Base.metadata.create_all()` — which can create
+missing tables but can never `ALTER` an existing one — stopped being
+sufficient. Alembic was introduced for exactly this:
+
+```bash
+alembic upgrade head          # apply all migrations (run this after cloning, or after pulling schema changes)
+alembic revision --autogenerate -m "describe your change"   # after editing app/database/models.py
+alembic downgrade -1          # roll back one migration
+```
+
+`migrations/env.py` reads `Settings.database_url` (so it always points at
+whatever `.env`/`DATABASE_URL` configures — SQLite or Postgres, no
+separate config) and imports `app.database.models` so every ORM table is
+visible to autogenerate. The one migration so far,
+`86de312205ca_initial_schema`, is a complete from-scratch schema (this
+project's first-ever Alembic revision, so there was no prior baseline to
+diff against).
+
+In **development**, `init_db()` still runs `create_all()` on startup for
+zero-friction setup. In **production** (`ENVIRONMENT=production`),
+`init_db()` skips `create_all()` entirely and logs that the schema is
+Alembic-owned — see [§13](#13-milestone-6--productionization); the
+Docker image's `CMD` runs `alembic upgrade head` before starting uvicorn.
+
+### Example conversation flow
+
+```
+POST /conversations                          -> {conversation_id: "c1", title: null, ...}
+POST /chat  {"question": "What is SMOTE?", "session_id": "c1"}
+   -> title auto-generated ("SMOTE: Synthetic Oversampling Explained"), turn persisted with sources
+POST /chat  {"question": "What are its disadvantages?", "session_id": "c1"}
+   -> rewritten_query: "What are the disadvantages of SMOTE?" (bounded history resolves "its")
+POST /chat  {"question": "Is there a way to fix that?", "session_id": "c1"}
+   -> rewritten_query references the disadvantage from the previous turn
+GET  /conversations/c1                       -> all 3 user/assistant turns, each assistant turn with its sources
+```
+
+---
+
+## 13. Milestone 6 — Productionization
+
+### Docker / docker-compose
+
+```bash
+cp .env.example .env        # fill in GEMINI_API_KEY at minimum
+docker compose up --build
+```
+
+- `backend` (port 8000) — runs `alembic upgrade head` then `uvicorn`, healthcheck hits `/api/v1/health`.
+- `frontend` (port 8501) — Streamlit, points at `http://backend:8000` inside the compose network.
+- `db` — `postgres:16-alpine`; the backend's `DATABASE_URL` is overridden to point at it (compose sets `ENVIRONMENT=production`, so `init_db()` defers entirely to Alembic — see §12).
+- **No separate vector-database service.** FAISS (`app/rag/vectorstore`) is a file-based index with no server process — it just lives on the `vectorstore-data` named volume alongside the backend container. A future Qdrant/pgvector swap would add a service here; today it would be pure overhead.
+
+Named volumes (`uploads-data`, `processed-data`, `vectorstore-data`,
+`logs-data`, `postgres-data`) persist across `docker compose down` (but
+not `down -v`).
+
+### Environment variables (Docker-specific additions)
+
+Everything from earlier milestones still applies (`.env.example` is the
+single source of truth). New in this milestone:
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `LOG_FORMAT` | `text` | `text` for local dev, `json` for log aggregators (CloudWatch/Loki/ELK) — see below. |
+| `MAX_UPLOAD_SIZE_MB` | `25` | Hard cap enforced in `DocumentService.upload()`, before any file is written to disk. |
+| `RATE_LIMIT_DEFAULT` | `60/minute` | Applied to `/chat`, `/chat/stream`, `/agent`. |
+| `RATE_LIMIT_UPLOAD` | `10/minute` | Applied to `/documents/upload`. |
+| `RATE_LIMIT_EVALUATION` | `3/hour` | Applied to `/evaluation/benchmark` — deliberately strict; each run costs ~20+ real Gemini calls against a 20/day free-tier quota. |
+| `POSTGRES_USER` / `POSTGRES_PASSWORD` / `POSTGRES_DB` | `rag` / `change-me` / `rag` | Only read by `docker-compose.yml`, to configure the `db` service and build `DATABASE_URL`. |
+
+No API key or credential is ever hardcoded anywhere in the codebase —
+everything flows through `Settings` (`app/core/config.py`), sourced from
+`.env` (gitignored) or the container's environment.
+
+### Structured logging + request IDs
+
+`app/core/request_id.py` generates a UUID per request (or reuses an
+inbound `X-Request-ID` header — useful behind a load balancer or API
+gateway that already assigns one), stores it in a `ContextVar`, returns
+it on the response, and injects it into every log record via
+`RequestIDLogFilter`. `app/core/logging.py` picks the format:
+
+```
+LOG_FORMAT=text   →  2026-08-22 01:00:00 | INFO     | request_id=3f2a... | app.services.chat_service | ...
+LOG_FORMAT=json   →  {"timestamp": "...", "level": "INFO", "logger": "...", "message": "...", "request_id": "3f2a..."}
+```
+
+This is what makes one request's behavior traceable end-to-end (retrieval,
+generation, tool calls) across every log line it touches, in either a
+human-reading dev setup or a machine-parsing production log pipeline.
+
+### Rate limiting
+
+`app/core/rate_limit.py` defines one shared `slowapi.Limiter` (keyed by
+client IP), wired into `app.main` with a `429` handler and
+`SlowAPIMiddleware`. `/chat`, `/chat/stream` and `/agent` use
+`RATE_LIMIT_DEFAULT`; `/documents/upload` uses the stricter
+`RATE_LIMIT_UPLOAD`; `/evaluation/benchmark` uses the much stricter
+`RATE_LIMIT_EVALUATION`. Verified in `tests/test_production_hardening.py`
+by actually tripping a 429, not just asserting the decorator is present.
+
+**Known limitation:** the limiter's storage is in-memory per process — if
+the backend ever runs as multiple replicas behind a load balancer, each
+replica enforces its own independent counter (see [§14](#14-security-performance-and-scalability)).
+
+### File validation
+
+`DocumentService.upload()` enforces, in order: PDF-only extension (415),
+non-empty content (400), size under `MAX_UPLOAD_SIZE_MB` (413). Storage
+filenames are always a fresh server-generated UUID
+(`{document_id}.pdf`) — the client-supplied filename is stored only as a
+display label in the database, never used to build a filesystem path, so
+there's no path-traversal surface from upload filenames.
+
+### Health check
+
+`GET /api/v1/health` now actually executes `SELECT 1` against the
+database and reports `status: "degraded"` + `database: "unavailable"` on
+failure, instead of only confirming the process is alive — a dead
+database is the most realistic way this service actually fails in
+production, and the Docker healthcheck depends on this endpoint.
+
+### API documentation
+
+FastAPI's auto-generated OpenAPI docs (`/docs`, `/redoc`) now carry a
+real title/description (`app/main.py`) explaining what the service does
+and noting the `X-Request-ID` tracing header — no changes needed beyond
+that; every endpoint's request/response schemas were already fully typed
+Pydantic models from earlier milestones.
+
+### Streamlit UI (multi-page)
+
+| Page | Contents |
+|---|---|
+| **Chat** (`streamlit_app.py`, home) | Mode toggle — 💬 Direct RAG (streamed, citations, confidence, per-stage retrieval diagnostics) vs 🤖 Agent (tool-usage indicator: tools called, aggregated sources, reasoning summary, execution time). Sidebar: backend/storage status, **New conversation**, **Conversation history** (load or delete any past conversation), links to the other pages. |
+| **Documents** (`pages/1_Documents.py`) | Upload, ingestion status, chunk preview, re-index, delete — unchanged logic from Milestone 1, moved out of a tab into its own page. |
+| **Evaluation** (`pages/2_Evaluation.py`) | Button-triggered retrieval benchmark (never automatic — see the rate-limit note above), overall + per-category Recall@k/MRR tables, and a "failed queries" breakdown per strategy. |
+| **Settings** (`pages/3_Settings.py`) | Read-only: backend health, environment, DB status, storage stats. Configuration itself is environment-variable-driven on the backend, so there's nothing to edit here. |
+
+Agent-mode turns are answered live but **not** persisted to conversation
+history — `AgentService` doesn't write to `ConversationRecord`
+(`app.services.agent_service` never touches the database in that way);
+only Direct-RAG turns (`ChatService`) are saved and reloadable. The
+Streamlit page says this explicitly rather than implying otherwise.
+
+### Architecture diagram
+
+```mermaid
+flowchart TB
+    subgraph Client["Client (Docker: frontend)"]
+        UI["Streamlit UI<br/>Chat · Documents · Evaluation · Settings"]
+    end
+
+    subgraph Backend["Backend (Docker: backend)"]
+        MW["Middleware:<br/>RequestID → CORS → SlowAPI rate limit"]
+        API["FastAPI routers<br/>health · documents · chat · agent · conversations · evaluation"]
+        AGENT["Agent Service<br/>(JSON-action loop, 4 tools, guardrails)"]
+        RAG["Chat Service<br/>(memory → rewrite → retrieve → generate → cite)"]
+        RET["Retrieval<br/>Vector (FAISS) ⟷ BM25 ⟷ RRF fusion ⟷ Cross-encoder rerank"]
+        GEN["Generation<br/>Gemini chat (query rewrite + answer)"]
+    end
+
+    subgraph Data["Data"]
+        FAISS[("FAISS index<br/>(file-based, volume-mounted)")]
+        PG[("PostgreSQL<br/>documents · users · conversations · messages · sources")]
+    end
+
+    EXT["External: Gemini API · DuckDuckGo web search"]
+
+    UI -->|HTTP JSON / streaming| MW --> API
+    API --> AGENT
+    API --> RAG
+    AGENT -->|document_search_tool calls ChatService| RAG
+    AGENT -->|web_search_tool, calculator_tool, document_summary_tool| EXT
+    RAG --> RET
+    RAG --> GEN
+    RET --> FAISS
+    RET --> PG
+    GEN --> EXT
+    API --> PG
+```
+
+### Sequence diagram — User → Agent → RAG → Retrieval → LLM
+
+```mermaid
+sequenceDiagram
+    actor User
+    participant UI as Streamlit
+    participant API as FastAPI (/agent)
+    participant Agent as AgentOrchestrator
+    participant Tool as document_search_tool
+    participant RAG as ChatService
+    participant Ret as Retrieval (Vector/Hybrid)
+    participant LLM as Gemini
+
+    User->>UI: Ask a question
+    UI->>API: POST /agent {query, session_id}
+    API->>Agent: run(request)
+    Agent->>LLM: Which tool (if any)?
+    LLM-->>Agent: {"action": "document_search_tool", "action_input": {...}}
+    Agent->>Tool: invoke(action_input)
+    Tool->>RAG: ask(question)
+    RAG->>Ret: retrieve(query, filters)
+    Ret->>Ret: embed query, FAISS search (+BM25/fusion/rerank if hybrid)
+    Ret-->>RAG: relevant chunks (scored, deduped)
+    RAG->>LLM: generate answer from chunks only
+    LLM-->>RAG: cited answer text
+    RAG-->>Tool: {answer, sources}
+    Tool-->>Agent: observation
+    Agent->>LLM: final_answer?
+    LLM-->>Agent: {"action": "final_answer", ...}
+    Agent-->>API: {answer, tools_used, sources, reasoning_summary, execution_time}
+    API-->>UI: JSON response
+    UI-->>User: Answer + tool-usage indicator + sources
+```
+
+---
+
+## 14. Security, performance, and scalability
+
+Honest gaps, not hidden ones — this is a portfolio project, and the point
+of this section is to show awareness of what "production" would still
+need beyond what's built:
+
+**Security**
+
+- **No real authentication.** Every conversation belongs to one
+  auto-provisioned default user (§12). Anyone with network access to the
+  backend can read/write any conversation and upload documents. A real
+  deployment needs an auth layer (JWT/OAuth) in front of every endpoint
+  before this is internet-facing.
+- **CORS defaults to `localhost:8501` only** (`BACKEND_CORS_ORIGINS`) —
+  intentionally narrow; widen deliberately, never to `*`, if the frontend
+  moves to a real domain.
+- **No TLS termination in this repo.** `docker-compose.yml` exposes plain
+  HTTP; a real deployment puts a reverse proxy (nginx/Caddy/a cloud load
+  balancer) in front for HTTPS — out of scope for a local/demo compose file.
+- **Secrets are env-var only**, never committed (`.env` is gitignored,
+  `.env.example` has placeholders only) — but for a real deployment,
+  a secrets manager (AWS Secrets Manager, Vault, etc.) is a stronger
+  guarantee than a `.env` file on disk.
+- **Upload validation is extension/size-based, not content-sniffed** —
+  a file named `x.pdf` that isn't actually a valid PDF will fail later,
+  inside `pypdf`, as a caught ingestion error (`status: "failed"`,
+  `error_message` set), not silently — but it's not rejected at upload
+  time by magic-byte inspection. Acceptable for this project's threat
+  model (no untrusted multi-tenant uploads yet).
+
+**Performance**
+
+- **The cross-encoder reranker is CPU-bound and adds real latency**
+  (§10's benchmark: ~1-3s for the rerank step) — fine at demo scale,
+  worth GPU or a smaller model at real query volume.
+- **BM25's corpus is rebuilt from SQL on every hybrid-mode query**
+  (`rank_bm25` has no incremental index) — fine for hundreds of chunks,
+  a real scaling bottleneck for a large corpus (documented in §2).
+- **The agent's per-tool timeout abandons, but doesn't kill, a hung
+  thread** (`ThreadPoolExecutor`, no `with` block, deliberately — see
+  §11) — under sustained abuse this can accumulate lingering threads;
+  fine for expected usage, a real concern under adversarial load.
+- **Gemini's free tier is a hard daily request ceiling** (not just
+  per-minute) — the agent (2+ calls/query) and the evaluation benchmark
+  (~20+ calls/run) can exhaust it well before `RATE_LIMIT_DEFAULT` would
+  ever kick in; `RATE_LIMIT_EVALUATION` (3/hour) is a direct mitigation
+  for the second case.
+
+**Scalability**
+
+- **FAISS is a single file, not a distributed store** — it scales
+  vertically (bigger disk/RAM), not horizontally, and every backend
+  replica would need to share the same volume (or move to a server-based
+  vector DB — Qdrant/pgvector — which the `VectorStore` interface already
+  supports swapping to without touching `app/services/`).
+- **The rate limiter's counters are per-process, in-memory** — running
+  multiple backend replicas means each enforces its own independent
+  limit rather than a shared global one; a real multi-replica deployment
+  needs a shared backend (Redis) for `slowapi`'s storage.
+- **SQLite is the local/dev default; PostgreSQL is the intended
+  production database** (`DATABASE_URL`, docker-compose's `db` service)
+  — the SQLAlchemy/Alembic code path is identical either way, so this is
+  a config change, not a code change, but SQLite itself should never be
+  used for a real concurrent-write production deployment.
+- **No background job queue.** Document ingestion runs synchronously
+  inside the upload request — fine for single small PDFs, a real
+  bottleneck for large batches or large files; a production system would
+  offload ingestion to a task queue (Celery/RQ/arq) and let the client
+  poll or subscribe for completion.
+
+---
+
+## 15. Production-readiness checklist
+
+- [x] Backend Dockerfile (multi-stage-ready, CPU-only torch, healthcheck, runs `alembic upgrade head` before serving).
+- [x] Frontend Dockerfile (minimal deps — streamlit + requests only, not the full backend stack).
+- [x] `docker-compose.yml` — backend + frontend + PostgreSQL; documented why no separate vector-DB service.
+- [x] Environment variable management reviewed for Docker (`POSTGRES_*`, `ENVIRONMENT=production` switching `init_db()` behavior).
+- [x] No hardcoded API keys or credentials anywhere in the codebase (verified — everything flows through `Settings`).
+- [x] `.env.example` updated for Postgres/Docker/rate-limit/upload-size variables.
+- [x] Structured logging — text or JSON (`LOG_FORMAT`), every record carries `request_id`.
+- [x] Request IDs — `X-Request-ID` middleware, contextvar, propagated into every log line and the response header.
+- [x] Error handling — `AppException` hierarchy + registered FastAPI handlers (pre-existing, reviewed, unchanged).
+- [x] Health check — now checks real DB connectivity, not just process liveness.
+- [x] API documentation — OpenAPI title/description; every schema already fully typed.
+- [x] Rate limiting — `slowapi`, tuned per-endpoint, verified by an actual 429 in tests.
+- [x] File validation — PDF-only, size cap, UUID-based safe storage naming.
+- [x] Multi-page Streamlit UI — Chat (with conversation history + agent mode), Documents, Evaluation, Settings.
+- [x] README — architecture, features, installation, env vars, local + Docker running instructions, API endpoints, evaluation, limitations.
+- [x] Architecture diagram + sequence diagram (Mermaid, renders natively on GitHub).
+- [x] Automated tests for the new production features (request id, rate limiting, file validation) — 125+ tests total, all passing.
+- [x] Final code-quality pass on all Milestone 5/6 additions (this document + the diff itself).
+- [x] Security/performance/scalability issues identified and written up honestly (§14) — not fixed where fixing would be out of scope for a portfolio project, but named explicitly.
+- [ ] CI pipeline — not set up (would be the natural next addition: run `pytest` + a Docker build on every push).
+- [ ] Real authentication — deliberately out of scope; the schema (`UserRecord`) is shaped to support it later.

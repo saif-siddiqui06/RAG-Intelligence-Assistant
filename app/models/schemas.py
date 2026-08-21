@@ -11,3 +11,4 @@ class HealthResponse(BaseModel):
     app_name: str
     version: str
     environment: str
+    database: str  # "ok" | "unavailable"
