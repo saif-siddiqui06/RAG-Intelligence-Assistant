@@ -1,5 +1,5 @@
 """Integration tests for DocumentService, using a fake embedder and an
-isolated FAISS index so nothing here hits the real OpenAI API or the
+isolated FAISS index so nothing here hits the real embedding provider API or the
 developer's real data/ directory.
 """
 import io
@@ -19,7 +19,7 @@ from app.services.document_service import DocumentService, DuplicateDocumentErro
 
 
 class FakeEmbedder(BaseEmbedder):
-    """Deterministic, network-free stand-in for OpenAIEmbedder."""
+    """Deterministic, network-free stand-in for a real embedder."""
 
     dimension_size = 8
 
@@ -68,7 +68,7 @@ def settings(tmp_path) -> Settings:
 
 @pytest.fixture(autouse=True)
 def _patch_pipeline(monkeypatch, tmp_path):
-    """Swap the real OpenAI/FAISS singletons for fast, network-free fakes."""
+    """Swap the real Gemini/FAISS singletons for fast, network-free fakes."""
     embedder = FakeEmbedder()
     vector_store = FaissVectorStore(
         index_path=tmp_path / "test_index.faiss", dimension=embedder.dimension_size

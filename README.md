@@ -1,6 +1,6 @@
 # Agentic RAG Research Assistant
 
-A portfolio-grade, production-style **Agentic RAG** system: a GPT-based agent
+A portfolio-grade, production-style **Agentic RAG** system: an LLM-based agent (Gemini)
 that routes between document retrieval, web search and a calculator tool,
 built on top of an advanced RAG pipeline (hybrid retrieval, reranking, query
 rewriting, citations) with conversational memory and automated evaluation.
@@ -9,11 +9,11 @@ This repository is built **incrementally, milestone by milestone**. This
 README reflects the current milestone and will be updated as each new one
 lands.
 
-> **Current milestone: 1 — Document Ingestion Pipeline.**
-> PDF upload/list/delete/re-index, extraction, cleaning, configurable
-> chunking, OpenAI embeddings, a persistent FAISS vector store and a SQL
-> metadata store. No hybrid search, reranking, agents or evaluation yet —
-> that's by design. See [Roadmap](#4-roadmap).
+> **Current milestone: 2 — Core Advanced RAG (retrieval + generation).**
+> Semantic retrieval, metadata filtering, LLM query rewriting, bounded
+> conversational memory, context selection/dedup, grounded + cited answer
+> generation, hallucination prevention, and streaming. No hybrid search,
+> reranking or agents yet — that's by design. See [Roadmap](#4-roadmap).
 
 ---
 
@@ -35,69 +35,105 @@ lands.
                                   │
                                   ▼
                        ┌─────────────────────┐
-                       │   Agent / Router    │
-                       │        (GPT)        │
+                       │   Agent / Router    │   ← not built yet (Milestone 4)
+                       │      (Gemini)       │
                        └──────────┬──────────┘
                                   │
              ┌────────────────────┼────────────────────┐
              │                    │                    │
              ▼                    ▼                    ▼
-       Document RAG          Web Search           Calculator
+       Document RAG          Web Search           Calculator      ← tools not built yet
              │
              ▼
-      Query Rewriting
+      Query Rewriting                                              ← implemented
              │
              ▼
-       Hybrid Retrieval
-       ┌──────────────┐
-       │ Vector Search│
-       │ BM25 Search  │
+       Hybrid Retrieval                                             ← vector-only so far;
+       ┌──────────────┐                                               BM25 + reranker not yet
+       │ Vector Search│  ← implemented
+       │ BM25 Search  │  ← not built yet
        └──────┬───────┘
               ▼
-          Reranker
+          Reranker                                                  ← not built yet
               │
               ▼
-       Relevant Chunks
+       Relevant Chunks                                               ← implemented (dedup)
               │
               ▼
-          GPT / LLM
+          LLM (Gemini)                                                  ← implemented
               │
        ┌──────┴───────┐
        ▼              ▼
-   Answer         Citations
+   Answer         Citations                                          ← both implemented
 ```
 
-### Ingestion flow — **implemented this milestone**
+### This milestone's request lifecycle — **implemented**
 
 ```
-PDF → extraction → cleaning → chunking → metadata → embeddings → vector database
-                                              │
-                                              ▼
-                                   SQL metadata store (SQLite/Postgres)
+User Query
+   │
+   ▼
+Memory ──────────────► bounded window of prior messages (SQL, not the full transcript)
+   │
+   ▼
+Query Rewrite ───────► LLM folds conversational context into one standalone,
+   │                   retrieval-optimized query (skipped on a conversation's first turn)
+   ▼
+Retrieval ───────────► embed the rewritten query, semantic search (optionally
+   │                   restricted to one document / one document type)
+   ▼
+Context Selection ───► drop near-duplicate chunks, keep top_k by score,
+   │                   discard anything below the relevance floor
+   ▼
+LLM ─────────────────► generate an answer using ONLY the selected chunks
+   │                   (streamed token-by-token), or skip straight to a fixed
+   │                   "cannot determine this" answer if nothing cleared the bar
+   ▼
+Citation ────────────► parse [n] markers out of the answer text, map back to
+   │                   (document name, page number, chunk id)
+   ▼
+Response ────────────► {answer, sources, retrieved_chunks, confidence,
+                        rewritten_query, session_id}
 ```
 
-### What exists today (Milestone 0 + 1)
+See [§3](#3-request-lifecycle-explained) for a step-by-step walkthrough of
+exactly which module does what.
+
+### What exists today (Milestone 0 + 1 + 2)
 
 ```
 Streamlit  →  FastAPI  →  /api/v1/health
                        →  /api/v1/documents/{upload,list,get,delete,reindex,chunks,stats}
+                       →  /api/v1/chat, /api/v1/chat/stream
                               │
-                              ▼
-                     DocumentService (app/services)
-                       │                    │
-                       ▼                    ▼
-              IngestionPipeline      SQL metadata store
-              (app/rag/ingestion)    (app/database — SQLite by default)
-                       │
-                       ▼
-          OpenAI embeddings → FAISS vector store
-          (app/rag/embeddings)  (app/rag/vectorstore)
+                 ┌────────────┴─────────────┐
+                 ▼                          ▼
+         DocumentService              ChatService
+      (ingestion orchestration)   (conversational RAG orchestration)
+                 │                          │
+                 ▼                    ┌─────┴──────┐
+        IngestionPipeline             ▼            ▼
+       (app/rag/ingestion)   RetrievalService   QueryRewriter / AnswerGenerator
+                 │           (app/services)     (app/rag/generation)
+                 │                  │                    │
+                 └──────────┬───────┘                    │
+                            ▼                             │
+              Gemini embeddings ◄──────── shared ─────────┘
+              (app/rag/embeddings)              Gemini chat completions
+                            │
+                            ▼
+                  FAISS vector store
+                (app/rag/vectorstore)
+                            │
+                            ▼
+              SQL metadata store (documents, chunks, conversations, messages)
+                      (app/database — SQLite by default)
 ```
 
-The agent router, web search/calculator tools, hybrid retrieval/reranking,
-query rewriting, chat memory and evaluation harness are all still empty
-placeholder packages with docstrings — no logic yet. This keeps the
-codebase honest: imports don't lie about what's implemented.
+The agent router, web search/calculator tools, hybrid (BM25) retrieval,
+reranking, and the evaluation harness are all still empty placeholder
+packages with docstrings — no logic yet. This keeps the codebase honest:
+imports don't lie about what's implemented.
 
 ---
 
@@ -113,138 +149,186 @@ RAG/
 │   │       ├── router.py        #   aggregates all v1 endpoint routers
 │   │       └── endpoints/
 │   │           ├── health.py    #   GET /health
-│   │           └── documents.py #   document upload/list/get/delete/reindex/chunks/stats
+│   │           ├── documents.py #   document upload/list/get/delete/reindex/chunks/stats
+│   │           └── chat.py      #   POST /chat, POST /chat/stream
 │   ├── core/
-│   │   ├── config.py            #   Settings (pydantic-settings): app, DB, RAG/chunking, OpenAI
+│   │   ├── config.py            #   Settings: app, DB, chunking, retrieval, confidence thresholds
 │   │   ├── logging.py           #   logging.dictConfig setup (console + rotating file)
 │   │   └── exceptions.py        #   AppException hierarchy + FastAPI error handlers
 │   ├── models/                  # Pydantic schemas (API contracts), not ORM models
 │   │   ├── schemas.py           #   HealthResponse
-│   │   └── document.py          #   Document/Chunk/Stats request-response schemas
+│   │   ├── document.py          #   Document/Chunk/Stats request-response schemas
+│   │   └── chat.py              #   ChatRequest/ChatResponse/SourceCitation/ChatStreamMeta
 │   ├── services/
-│   │   └── document_service.py  # Orchestrates rag/ + database/ for upload/list/delete/reindex
-│   ├── rag/                     # RAG pipeline — ingestion implemented, retrieval/chat not yet
-│   │   ├── ingestion/
-│   │   │   ├── extractor.py     #   PDF → per-page text (pypdf)
-│   │   │   ├── cleaner.py       #   whitespace/artifact normalization
-│   │   │   ├── chunker.py       #   configurable recursive-separator chunking
-│   │   │   ├── hasher.py        #   sha256 file hash (duplicate detection)
-│   │   │   └── pipeline.py      #   orchestrates extract→clean→chunk→embed→store
-│   │   ├── embeddings/
-│   │   │   ├── base.py          #   BaseEmbedder interface
-│   │   │   └── openai_embedder.py
-│   │   ├── vectorstore/
-│   │   │   ├── base.py          #   VectorStore interface (add/search/delete/count)
-│   │   │   ├── faiss_store.py   #   FAISS implementation
-│   │   │   └── factory.py       #   the one place a backend swap happens
-│   │   └── dependencies.py      #   cached singletons (embedder, vector store, pipeline)
+│   │   ├── document_service.py  #   Orchestrates rag/ingestion + database for documents
+│   │   ├── retrieval_service.py #   DB-aware retrieval: filters, chunk resolution, dedup
+│   │   └── chat_service.py      #   The conversational RAG orchestrator (memory→...→response)
+│   ├── rag/                     # RAG pipeline — pure logic, no DB/HTTP
+│   │   ├── ingestion/           #   extraction, cleaning, chunking, hashing (Milestone 1)
+│   │   ├── embeddings/          #   BaseEmbedder interface + Gemini implementation
+│   │   ├── vectorstore/         #   VectorStore interface + FAISS implementation + factory
+│   │   ├── retrieval/
+│   │   │   └── vector_retriever.py  # pure: embed query -> vector_store.search(allowed_ids)
+│   │   ├── generation/
+│   │   │   ├── base.py          #   BaseChatModel interface + gemini_chat_model.py implementation
+│   │   │   ├── prompts.py       #   every system/user prompt template, in one auditable file
+│   │   │   ├── query_rewriter.py    # LLM call #1: conversation -> standalone query
+│   │   │   └── answer_generator.py  # LLM call #2: query+chunks -> cited answer (streamable)
+│   │   └── dependencies.py      #   cached singletons (embedder, vector store, rewriter, generator)
 │   ├── agents/                  # [empty] GPT agent/router + tools (doc search, web search, calculator)
 │   ├── evaluation/               # [empty] retrieval/faithfulness/correctness evaluation harness
 │   ├── database/
 │   │   ├── session.py           #   SQLAlchemy engine/session + init_db()
-│   │   └── models.py            #   DocumentRecord, ChunkRecord ORM models
+│   │   └── models.py            #   DocumentRecord, ChunkRecord, ConversationRecord, MessageRecord
 │   └── utils/                   # small, dependency-free helpers shared across the app
 ├── frontend/
-│   ├── streamlit_app.py         # upload / list / preview chunks / delete / re-index UI
+│   ├── streamlit_app.py         # Chat tab (streamed, cited, filterable) + Documents tab
 │   └── api_client.py            #   the only module allowed to call `requests` against the backend
 ├── tests/                       # pytest suite — see §7
-├── data/
-│   ├── uploads/                 # raw uploaded PDFs, named {document_id}.pdf (gitignored contents)
-│   ├── processed/                # metadata.db (SQLite) lives here by default (gitignored contents)
-│   └── vectorstore/              # index.faiss + index.meta.json (gitignored contents)
-├── logs/                        # rotating app.log (gitignored contents)
-├── requirements.txt              # runtime deps (+ openai, faiss-cpu, pypdf this milestone)
-├── requirements-dev.txt          # + pytest, httpx, reportlab (test-only, generates PDF fixtures)
-├── pytest.ini
-├── .env.example
-└── .gitignore
+├── data/, logs/                 # gitignored contents — see Milestone 1 README section
+├── requirements.txt / requirements-dev.txt
+├── pytest.ini / .env.example / .gitignore
 ```
 
 **Why this layout (additions this milestone):**
 
-- **`rag/ingestion/` vs `rag/embeddings/` vs `rag/vectorstore/`** — three
-  independent concerns. `ingestion/` never imports FAISS or OpenAI directly;
-  it depends only on the `BaseEmbedder` and `VectorStore` interfaces. This is
-  what makes "swap FAISS for Chroma/Qdrant/pgvector without rewriting the
-  app" literally true — add a new class in `vectorstore/`, add one branch to
-  `vectorstore/factory.py`, done.
-- **Ingestion is independent from the future chat/RAG pipeline** — as
-  instructed. `rag/ingestion/pipeline.py` only turns files into embedded,
-  stored chunks; it has no notion of a query, an answer, or a conversation.
-  The future retrieval/chat pipeline will reuse `embeddings/` and
-  `vectorstore/` (to embed a query and search the same index) but will never
-  import anything from `ingestion/`.
-- **Vector store holds vectors + integer ids only; SQL holds everything
-  else** — `ChunkRecord.vector_id` is the join key. This means the metadata
-  (filename, document_id, page number, chunk_id, timestamps, chunk text
-  itself) is 100% decoupled from which vector backend is active.
-- **`app/database/` is now wired in** — `init_db()` runs at startup and
-  creates tables via `Base.metadata.create_all()` (no Alembic yet; that's a
-  deliberate later "productionization" concern). `DATABASE_URL` defaults to
-  a local SQLite file so ingestion works with zero extra infra — switching
-  to Postgres later is only an env var change, not a code change.
-- **`document_service.py` is the only thing that talks to both `rag/` and
-  `database/`** — endpoints in `api/v1/endpoints/documents.py` never touch
-  either directly.
+- **`rag/retrieval/` vs `services/retrieval_service.py`** — the same split as
+  ingestion: `vector_retriever.py` is pure (embed + search an optional
+  `allowed_ids` set, no DB), while `retrieval_service.py` is the DB-aware
+  layer that turns a document/document-type filter into `allowed_ids`,
+  resolves hits to chunk content, and removes near-duplicates. This is what
+  makes retrieval independently testable (fake embedder + real FAISS index,
+  no service layer needed) and independently swappable.
+- **Metadata filtering without hybrid search** — FAISS's flat index has no
+  native filtered search. `VectorStore.search()` grew an `allowed_ids`
+  parameter; the FAISS implementation reconstructs and scores only the
+  allowed vectors directly (`IndexIDMap2.reconstruct`), which is exact, not
+  approximate, since the underlying index was already an exact flat scan.
+  A future Qdrant/pgvector backend would instead pass `allowed_ids` as a
+  native indexed filter — same interface, better performance, no app code
+  changes.
+- **"Keep retrieval, prompting and generation as separate services"** —
+  `retrieval_service.py` (retrieval), `rag/generation/prompts.py` (prompting
+  — every prompt template lives in one auditable file), and
+  `rag/generation/answer_generator.py` (generation) are three distinct
+  modules; `chat_service.py` is the only thing that sequences them.
+- **Conversational memory is minimal on purpose** — `ConversationRecord` /
+  `MessageRecord` exist only to give query rewriting a bounded window of
+  prior turns to read (`Settings.conversation_history_window`, default 6
+  messages). Full session management (titles, ownership, expiry) is
+  Milestone 5's job; this is deliberately just enough to make follow-up
+  questions work.
+- **Citations come from parsing the answer, not JSON mode** — the model is
+  asked to inline-cite with `[n]` markers instead of returning structured
+  JSON. That's what makes streaming practical: the client renders raw text
+  as it arrives and only needs to parse citation markers once, after the
+  stream ends. See `answer_generator.extract_cited_indices`.
+- **Two-phase streaming (`prepare()` then `stream_answer()`)** — query
+  rewriting and retrieval (which embeds the query — a real failure point,
+  e.g. a bad API key) run synchronously *before* the streaming HTTP response
+  begins, so a failure there still becomes a clean JSON error. Only the
+  actual answer-generation LLM call streams, which is the one place a
+  "failure mid-response" is genuinely unavoidable.
+- **The provider swap actually happened, not just in theory** — this project
+  started on OpenAI (embeddings + chat) and was migrated to Gemini (free
+  tier, no credit card) for both. `BaseEmbedder` already made the embeddings
+  side a one-file swap; the chat side didn't have an equivalent interface
+  yet, so `app/rag/generation/base.py` (`BaseChatModel`) was added as part of
+  this migration — `query_rewriter.py`/`answer_generator.py` now depend only
+  on that interface, never on a provider SDK shape. Zero changes were needed
+  to `chat_service.py`, `retrieval_service.py`, prompts, or any test's
+  assertions — only the provider implementation and the dependency wiring
+  in `app/rag/dependencies.py` changed.
 
 ---
 
-## 3. What's implemented in this milestone
+## 3. Request lifecycle, explained
 
-- **Upload** (`POST /api/v1/documents/upload`, multiple files) — validates
-  PDF type, computes a SHA-256 content hash, rejects exact duplicates
-  (`409`), saves the raw file under `data/uploads/{document_id}.pdf`, then
-  runs the full pipeline synchronously.
-- **Extraction** (`app/rag/ingestion/extractor.py`) — per-page text via
-  `pypdf`, with typed failures for corrupt/encrypted/unreadable files.
-- **Cleaning** (`cleaner.py`) — strips null bytes, collapses whitespace,
-  normalizes blank lines.
-- **Chunking** (`chunker.py`) — a from-scratch recursive-separator splitter
-  (paragraph → line → sentence → word → character fallback), fully
-  configurable (`chunk_size`, `chunk_overlap`, `separators`), with overlap
-  carried between consecutive chunks. Overridable per-request via
-  `?chunk_size=&chunk_overlap=` query params, or globally via `.env`.
-- **Metadata** — every chunk keeps `document_id`, `chunk_id`, `page_number`,
-  `chunk_index`, plus document-level `filename`, `document_type`,
-  `upload_timestamp`, `status`, all persisted in SQL (`app/database/models.py`).
-- **Embeddings** (`openai_embedder.py`) — OpenAI `text-embedding-3-small` by
-  default, batched requests, clean `502` on provider failure.
-- **Vector store** (`faiss_store.py`) — persistent FAISS `IndexIDMap2` +
-  `IndexFlatIP` (cosine via L2-normalized vectors), surviving restarts.
-- **Duplicate prevention** — SHA-256 file hash is unique-indexed in SQL;
-  re-uploading identical bytes is rejected without re-running the pipeline.
-- **Document management** — list (`GET /documents`), get one (`GET
-  /documents/{id}`), preview chunks (`GET /documents/{id}/chunks`), delete
-  (`DELETE /documents/{id}`, removes DB rows + vectors + the stored file),
-  re-index (`POST /documents/{id}/reindex`, re-runs the pipeline on the
-  already-stored file with fresh/updated chunking config).
-- **Stats** (`GET /documents/stats/summary`) — total documents, total
-  chunks, total vectors in the index — the quickest way to verify storage.
-- **Streamlit UI** — upload with configurable chunk size/overlap, live
-  document list with status/page/chunk counts, per-document chunk preview,
-  delete and re-index buttons, sidebar storage stats.
-- **Error handling** — typed `AppException` subclasses for duplicate
-  uploads (`409`), not-found (`404`), bad file type (`415`), empty file
-  (`400`), corrupt/encrypted/text-less PDFs (`422`), missing API key or
-  provider failure (`500`/`502`).
-- **Logging** — every upload/delete/reindex/failure logged via the
-  rotating `logs/app.log` handler from Milestone 0.
-- **Tests** — see [§7 Testing](#7-testing).
+```
+User Query → Memory → Query Rewrite → Retrieval → Context Selection → LLM → Citation → Response
+```
+
+1. **User Query** — `POST /api/v1/chat` (or `/chat/stream`) receives
+   `{question, session_id?, document_id?, document_type?, top_k?}`
+   (`app/models/chat.py:ChatRequest`).
+
+2. **Memory** — `ChatService._get_or_create_conversation()` finds or creates
+   a `ConversationRecord` by `session_id` (server-generated if omitted).
+   `_load_history()` reads only the **last `conversation_history_window`
+   messages** (default 6 = ~3 turns) — never the full transcript.
+
+3. **Query Rewrite** — `QueryRewriter.rewrite(history, question)`
+   (`app/rag/generation/query_rewriter.py`). If there's no history yet (first
+   turn), it returns the question unchanged and **skips the LLM call
+   entirely**. Otherwise it sends the bounded history + question to the LLM
+   with a prompt that resolves pronouns/references into one standalone query
+   (`"What are its disadvantages?"` → `"What are the disadvantages of
+   SMOTE?"`). On any LLM failure it degrades gracefully to the original
+   question rather than failing the whole request.
+
+4. **Retrieval** — `RetrievalService.retrieve()` (`app/services/
+   retrieval_service.py`):
+   - resolves `document_id`/`document_type` into a set of allowed vector ids
+     via SQL (or `None` = search everything);
+   - embeds the rewritten query and searches FAISS, over-fetching
+     `top_k * retrieval_overfetch_multiplier` candidates;
+   - joins hits back to `ChunkRecord`/`DocumentRecord` for content + citation
+     metadata.
+
+5. **Context Selection** — still inside `retrieve()`: candidates are sorted
+   by score, and any candidate whose text is a **near-duplicate** (>90%
+   similarity, `difflib.SequenceMatcher`) of an already-kept chunk is
+   dropped, before truncating to `top_k`. `ChatService` then drops anything
+   below `min_relevance_score` (default 0.15 cosine similarity) — if
+   *nothing* survives, generation is skipped entirely and the fixed
+   "cannot determine this from the uploaded documents" answer is returned
+   (hallucination prevention, layer 1 — deterministic, no LLM call spent).
+
+6. **LLM** — `AnswerGenerator.generate()` / `.generate_stream()`
+   (`app/rag/generation/answer_generator.py`) sends the query + numbered
+   source excerpts (`prompts.build_answer_messages`) with instructions to
+   answer only from those sources, cite every claim with `[n]`, and reply
+   with the exact fixed sentence if the sources are insufficient
+   (hallucination prevention, layer 2 — the model's own judgment, as a
+   second line of defense).
+
+7. **Citation** — `ChatService._finalize()` extracts cited `[n]` markers
+   (`extract_cited_indices`), maps them back to the actual chunk's filename/
+   page number/chunk id, and computes a heuristic `confidence` (high/medium/
+   low) from the average similarity score of the *cited* chunks — not a
+   calibrated metric, just a practical proxy (real faithfulness scoring is
+   the Evaluation milestone).
+
+8. **Response** — the turn (original question + final answer) is persisted
+   to `MessageRecord`, and the structured payload is returned:
+   ```json
+   {
+     "answer": "...",
+     "sources": [{"index": 1, "document_name": "...", "page_number": 12, "chunk_id": "..."}],
+     "retrieved_chunks": [...],
+     "confidence": "high",
+     "rewritten_query": "...",
+     "session_id": "..."
+   }
+   ```
+   `POST /chat/stream` sends the answer text as it's generated, then one
+   final chunk: `\n<<<META>>>\n` + this same payload minus `answer` (see
+   `STREAM_META_DELIMITER` in `chat_service.py`).
+
+---
 
 ## 4. Roadmap (not yet built — do not assume these exist)
 
-1. ~~**Document ingestion**~~ — done this milestone.
-2. **Core retrieval** — embed a query, similarity search, basic QA endpoint
-   (the first thing to consume `rag/embeddings` + `rag/vectorstore` from the
-   *query* side).
-3. **Advanced retrieval** — hybrid (vector + BM25) search, reranking, query
-   rewriting, citation-attributed answers.
-4. **Agent layer** — GPT-based router/tools: document search, web search,
+1. ~~**Document ingestion**~~ — done (Milestone 1).
+2. ~~**Core retrieval + generation**~~ — done this milestone.
+3. **Advanced retrieval** — hybrid (vector + BM25) search, reranking.
+4. **Agent layer** — LLM-based router/tools: document search, web search,
    calculator.
-5. **Memory** — conversation/session management (Postgres in production,
-   same SQLAlchemy models pattern as documents/chunks).
+5. **Memory** — full session management (titles, ownership, expiry) on top
+   of the `ConversationRecord`/`MessageRecord` tables already in place.
 6. **Evaluation** — retrieval quality, context relevance, answer
-   correctness, faithfulness/hallucination checks.
+   correctness, faithfulness/hallucination checks (real calibrated
+   confidence replaces today's heuristic).
 7. **Productionization** — Docker/Compose, Alembic migrations, CI,
    structured logging, secrets management.
 
@@ -255,8 +339,9 @@ RAG/
 ### Prerequisites
 
 - Python 3.10+
-- An OpenAI API key (**required this milestone** — embeddings call the real
-  API). PostgreSQL is **not** required; SQLite is used by default.
+- A free Gemini API key from [Google AI Studio](https://aistudio.google.com/apikey)
+  — no credit card required (embeddings + chat completions both call the
+  real API). PostgreSQL is **not** required; SQLite is used by default.
 
 ### Install dependencies
 
@@ -268,8 +353,6 @@ python -m venv .venv
 source .venv/bin/activate
 
 pip install -r requirements-dev.txt   # runtime + test deps
-# or, without test tooling:
-pip install -r requirements.txt
 ```
 
 ### Configure environment
@@ -278,14 +361,15 @@ pip install -r requirements.txt
 cp .env.example .env    # Windows: copy .env.example .env
 ```
 
-Then set a real key in `.env`:
+Set a real key in `.env` (get one free at https://aistudio.google.com/apikey):
 
 ```
-OPENAI_API_KEY=sk-...your real key...
+GEMINI_API_KEY=your real key...
 ```
 
-Everything else has a working default (SQLite metadata store, FAISS vector
-store, 1000/150 char chunk size/overlap).
+Retrieval/chat defaults worth knowing (all in `.env.example`, all overridable):
+`RETRIEVAL_TOP_K=5`, `MIN_RELEVANCE_SCORE=0.15`, `DEDUP_SIMILARITY_THRESHOLD=0.9`,
+`CONVERSATION_HISTORY_WINDOW=6`.
 
 ## 6. Running
 
@@ -300,15 +384,15 @@ uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 
 ### Frontend (Streamlit)
 
-In a second terminal (with the venv activated):
-
 ```bash
 streamlit run frontend/streamlit_app.py
 ```
 
-Open the URL Streamlit prints (default http://localhost:8501). Upload one or
-more PDFs, watch status/page/chunk counts populate, expand "Preview chunks"
-to see exactly what got embedded, and try Delete/Reindex.
+Open the **Documents** tab first, upload a PDF, wait for `status: completed`.
+Then switch to the **Chat** tab, optionally scope the search to one document
+or document type, and ask a question — the answer streams in with sources,
+confidence, and a "Retrieval details" expander showing exactly what was
+retrieved and how it scored.
 
 ## 7. Testing
 
@@ -318,73 +402,90 @@ pytest -v
 
 | File | Covers |
 |---|---|
-| `tests/test_health.py` | Milestone 0 smoke tests |
-| `tests/test_extractor.py` | PDF text extraction (multi-page, corrupt file) — generates real PDFs with `reportlab` |
-| `tests/test_chunker.py` | Chunking: size limits, overlap, custom separators, config validation, hard-slice fallback |
-| `tests/test_hasher.py` | SHA-256 hashing determinism/uniqueness (duplicate-detection primitive) |
-| `tests/test_metadata.py` | `DocumentRecord`/`ChunkRecord` defaults, API response mapping |
-| `tests/test_document_service.py` | Full service integration — duplicate rejection, multi-document upload, delete removes vectors, non-PDF rejection — using a fake network-free embedder |
+| `tests/test_health.py`, `test_extractor.py`, `test_chunker.py`, `test_hasher.py`, `test_metadata.py`, `test_document_service.py` | Milestones 0–1 (see prior README revisions) |
+| `tests/test_retrieval_service.py` | **Retrieval**: semantic ranking, document-id filter, document-type filter, empty-filter/empty-store behavior, near-duplicate context-selection |
+| `tests/test_query_rewriter.py` | **Query rewriting**: no-op on first turn (no LLM call), history-aware rewrite, prompt actually contains history, graceful fallback on LLM failure/blank response |
+| `tests/test_citations.py` | **Citation generation** (pure logic): marker extraction/ordering/dedup, out-of-range marker rejection, no-context-sentinel detection |
+| `tests/test_chat_service.py` | **Citation generation** (integration) + **no-context behavior**: correct index→source mapping, hallucination guard fires without ever calling the generation LLM, model-declines-anyway case forces empty sources, no-citation-markers falls back to crediting all sources, conversational follow-up is actually rewritten using persisted history, document filter is honored end-to-end |
 
-`test_document_service.py` never calls OpenAI: it monkeypatches the
-pipeline factory with a deterministic `FakeEmbedder`, so the full
-upload→chunk→embed→store→delete flow is tested without needing a real API
-key or network access. **The real `OpenAIEmbedder` path is not unit tested**
-— verify it manually (see below) with a real key.
+None of the new tests call the real LLM provider: `tests/fakes.py` provides a
+`KeywordFakeEmbedder` (deterministic, keyword-overlap-based similarity — good
+enough to test ranking/filtering) and a `FakeChatClient` (scripted responses
+for the `.chat.completions.create(...)` surface, streaming and non-streaming).
+**The real Gemini-backed paths are not unit tested** — verify them manually
+with a real key using the test plan below.
 
-## 8. Verify documents and embeddings were actually stored
+## 8. Test plan — verify RAG works correctly
 
-1. **Via the API directly:**
-   ```bash
-   curl -X POST http://localhost:8000/api/v1/documents/upload \
-     -F "files=@/path/to/your/paper.pdf"
-   ```
-   A `201` with a JSON body containing `"status": "completed"` and a
-   non-null `num_chunks` means extraction, chunking, embedding and storage
-   all succeeded.
+Prerequisites: a real `GEMINI_API_KEY` in `.env`, backend + Streamlit running,
+and **at least one PDF uploaded and `status: completed`** (a paper or article
+that discusses SMOTE works well for questions 1–4 below; substitute your own
+document's topic otherwise).
 
-2. **Check the stats endpoint:**
-   ```bash
-   curl http://localhost:8000/api/v1/documents/stats/summary
-   ```
-   `vector_count` should equal the sum of `num_chunks` across all completed
-   documents — this is the FAISS index's real vector count, not just a DB
-   row count, so if these ever diverge something is inconsistent.
-
-3. **Preview the actual stored chunks:**
-   ```bash
-   curl http://localhost:8000/api/v1/documents/{document_id}/chunks
-   ```
-   Confirms page numbers/chunk indices/content look right.
-
-4. **Inspect the files on disk:**
-   - `data/uploads/{document_id}.pdf` — the raw file you uploaded.
-   - `data/processed/metadata.db` — SQLite file; open it with any SQLite
-     browser (or `sqlite3 data/processed/metadata.db "select * from documents;"`)
-     to see the `documents` and `chunks` tables directly.
-   - `data/vectorstore/index.faiss` + `index.meta.json` — the persisted
-     FAISS index and its id counter. Delete these two files (with the app
-     stopped) to reset the vector store from scratch.
-
-5. **Restart the server and re-check** `GET /api/v1/documents` — if your
-   documents are still listed with the same chunk counts, persistence
-   across restarts is confirmed (this is why SQLite + FAISS-on-disk were
-   chosen over in-memory structures for this milestone).
+1. **Basic factual question** — *"What is SMOTE?"*
+   Expect a grounded answer with `[1]`-style citations and `sources`
+   pointing at real page numbers from your document.
+2. **Follow-up requiring coreference resolution** — *"What are its
+   disadvantages?"* (same session as #1)
+   Check the response's `rewritten_query` — it should read something like
+   *"What are the disadvantages of SMOTE?"*, not the raw follow-up.
+3. **Second follow-up, deeper chain** — *"Is there a way to fix that?"*
+   Confirms rewriting still works after 2+ turns, within the bounded history
+   window.
+4. **Out-of-scope question** — *"What is the capital of France?"*
+   Expect the exact fixed answer *"I cannot determine this from the uploaded
+   documents."*, `sources: []`, `confidence: "low"` — this is the
+   hallucination-prevention guard.
+5. **Question about a topic the document doesn't cover, but plausible for
+   the domain** — e.g. if your doc is about SMOTE, ask *"How does BERT
+   tokenization work?"*
+   Should also decline rather than hallucinate a bridge between unrelated
+   concepts.
+6. **New conversation reset** — click "New conversation" in Streamlit, ask
+   *"What are its disadvantages?"* with no prior turn.
+   Since there's no history, expect `rewritten_query` to equal the question
+   verbatim, and likely an ambiguous/low-relevance answer or a decline — the
+   system should **not** silently reuse the previous session's context.
+7. **Document-scoped search** — upload a second, unrelated PDF, then in the
+   Chat tab set "Search scope" to the *first* document only and ask a
+   question only the *second* document could answer.
+   Expect a decline, proving the `document_id` filter is actually applied,
+   not just cosmetic.
+8. **Document-type filter** — set "Document type" to PDF and confirm normal
+   questions still work (today, every ingested document is a PDF, so this is
+   mainly a smoke test that the filter doesn't wrongly exclude everything).
+9. **Streaming behaves like streaming** — watch the answer appear
+   incrementally in the Chat tab rather than all at once; open the network
+   tab / use `curl --no-buffer` against `/api/v1/chat/stream` and confirm
+   text arrives in multiple chunks, ending with the `<<<META>>>` delimiter
+   and a JSON blob.
+10. **Citations point at real content** — for any answered question, expand
+    "Retrieval details" and manually check that the `[1]`/`[2]` markers in
+    the answer correspond to chunks whose content actually supports the
+    claim next to that marker — not just that citations exist, but that
+    they're *correct*.
+11. **Duplicate-safe repeatability** — ask the same question twice in a row
+    (same session). Both answers should cite the same or overlapping
+    sources and stay consistent in tone/confidence — a sanity check that
+    retrieval isn't randomly unstable.
+12. **Confidence tracks relevance** — compare the `confidence` field between
+    a well-covered question (#1) and a borderline/tangential one; confidence
+    should be visibly lower for the latter even if it doesn't fully decline.
 
 ## 9. Verify before moving to the next milestone
 
-- [ ] `pip install -r requirements-dev.txt` completes with no errors.
-- [ ] A real `OPENAI_API_KEY` is set in `.env`.
-- [ ] `uvicorn app.main:app --reload` starts without exceptions.
-- [ ] Uploading a real PDF via `/docs` or Streamlit returns `status:
-      completed` with `num_pages`/`num_chunks` populated.
-- [ ] Re-uploading the same file returns `409 Conflict`.
-- [ ] `GET /api/v1/documents/stats/summary` shows `vector_count > 0`.
-- [ ] `data/processed/metadata.db` and `data/vectorstore/index.faiss` exist
-      on disk after an upload.
-- [ ] Deleting a document drops its rows and its vectors (`vector_count`
-      decreases accordingly).
-- [ ] `pytest -v` passes.
+- [ ] `pytest -v` passes (48+ tests).
+- [ ] A real `GEMINI_API_KEY` is set in `.env`.
+- [ ] At least one PDF uploaded and ingested successfully.
+- [ ] `POST /api/v1/chat` with no documents ingested returns the fixed
+      "cannot determine" answer with `confidence: "low"` and **no** Gemini
+      chat-completion call billed (only true once something is ingested —
+      before that, retrieval also skips embedding the query, see
+      `VectorRetriever.search`'s empty-store short-circuit).
+- [ ] Questions 1–12 in the test plan above all behave as described.
+- [ ] `data/processed/metadata.db` shows populated `conversations` and
+      `messages` tables after a chat (`sqlite3 data/processed/metadata.db
+      "select role, content from messages;"`).
 
-Once all of the above are true, ingestion is confirmed working end-to-end
-and we can start Milestone 2 (core retrieval: embedding a query and
-searching this same vector store).
+Once all of the above are true, core retrieval + generation is confirmed
+working end-to-end and we can start Milestone 3 (hybrid search + reranking).

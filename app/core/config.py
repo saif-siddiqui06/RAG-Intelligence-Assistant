@@ -34,10 +34,10 @@ class Settings(BaseSettings):
     # --- CORS ---
     backend_cors_origins: list[str] = ["http://localhost:8501"]
 
-    # --- OpenAI ---
-    openai_api_key: str = ""
-    openai_model: str = "gpt-4o-mini"
-    embedding_model: str = "text-embedding-3-small"
+    # --- Gemini (Google AI Studio — free tier, no credit card required) ---
+    gemini_api_key: str = ""
+    gemini_model: str = "gemini-2.5-flash"
+    embedding_model: str = "text-embedding-004"
 
     # --- Database ---
     # SQLite by default so ingestion works with zero extra infra. Swap to a
@@ -50,6 +50,15 @@ class Settings(BaseSettings):
     chunk_size: int = 1000
     chunk_overlap: int = 150
     chunk_separators: list[str] = ["\n\n", "\n", ". ", " ", ""]
+
+    # --- RAG / retrieval & chat ---
+    retrieval_top_k: int = 5
+    retrieval_overfetch_multiplier: int = 4  # candidates fetched = top_k * this, before dedup/threshold
+    min_relevance_score: float = 0.15  # cosine similarity floor; below this, a chunk is treated as noise
+    dedup_similarity_threshold: float = 0.9  # near-duplicate chunk text ratio (difflib) to drop a candidate
+    conversation_history_window: int = 6  # messages (not turns) kept for query rewriting
+    confidence_high_threshold: float = 0.5  # avg cited-chunk similarity above this -> "high"
+    confidence_medium_threshold: float = 0.3  # above this (but below high) -> "medium", else "low"
 
     # --- Storage paths ---
     upload_dir: Path = BASE_DIR / "data" / "uploads"

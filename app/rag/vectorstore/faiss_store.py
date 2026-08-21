@@ -41,14 +41,43 @@ class FaissVectorStore(VectorStore):
             self._persist()
             return ids
 
-    def search(self, query_vector: list[float], top_k: int = 5) -> list[tuple[int, float]]:
+    def search(
+        self, query_vector: list[float], top_k: int = 5, allowed_ids: set[int] | None = None
+    ) -> list[tuple[int, float]]:
         with self._lock:
             if self._index.ntotal == 0:
                 return []
             matrix = np.asarray([query_vector], dtype="float32")
             faiss.normalize_L2(matrix)
+
+            if allowed_ids is not None:
+                return self._search_filtered(matrix[0], top_k, allowed_ids)
+
             scores, ids = self._index.search(matrix, min(top_k, self._index.ntotal))
             return [(int(i), float(s)) for i, s in zip(ids[0], scores[0]) if i != -1]
+
+    def _search_filtered(
+        self, query_vec: np.ndarray, top_k: int, allowed_ids: set[int]
+    ) -> list[tuple[int, float]]:
+        """Exact scoring restricted to `allowed_ids`.
+
+        FAISS's flat index has no native filtered search, so we
+        reconstruct just the allowed vectors (IndexIDMap2 supports
+        `reconstruct` by external id — that's the reason this store uses
+        IDMap2 rather than plain IDMap) and score them directly. Since
+        the underlying index is already an exact flat scan (not ANN),
+        this is no less exact than an unfiltered search — only cheaper,
+        because it scores fewer vectors.
+        """
+        scored: list[tuple[int, float]] = []
+        for vector_id in allowed_ids:
+            try:
+                vector = self._index.reconstruct(int(vector_id))
+            except RuntimeError:
+                continue  # id not present (e.g. stale reference after a delete)
+            scored.append((int(vector_id), float(np.dot(query_vec, vector))))
+        scored.sort(key=lambda pair: pair[1], reverse=True)
+        return scored[:top_k]
 
     def delete(self, ids: list[int]) -> None:
         if not ids:

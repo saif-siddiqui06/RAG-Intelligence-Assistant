@@ -61,3 +61,39 @@ class ChunkRecord(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
 
     document: Mapped["DocumentRecord"] = relationship(back_populates="chunks")
+
+
+class ConversationRecord(Base):
+    """One row per chat session. Deliberately minimal today — the full
+    session-management milestone (titles, per-user ownership, expiry)
+    lands later; this just gives query rewriting somewhere durable to
+    read prior turns from.
+    """
+
+    __tablename__ = "conversations"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_id)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+
+    messages: Mapped[list["MessageRecord"]] = relationship(
+        back_populates="conversation",
+        cascade="all, delete-orphan",
+        order_by="MessageRecord.created_at",
+    )
+
+
+class MessageRecord(Base):
+    """One row per turn. Read in a bounded window (see
+    Settings.conversation_history_window) — never the full history —
+    when rewriting a follow-up question.
+    """
+
+    __tablename__ = "messages"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_id)
+    conversation_id: Mapped[str] = mapped_column(ForeignKey("conversations.id"), index=True)
+    role: Mapped[str] = mapped_column(String(20))  # "user" | "assistant"
+    content: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+
+    conversation: Mapped["ConversationRecord"] = relationship(back_populates="messages")
